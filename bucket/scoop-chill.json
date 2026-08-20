@@ -1,10 +1,16 @@
 {
-    "version": "0.0.1",
+    "version": "0.0.2",
     "description": "Update apps only once their manifest has aged",
     "homepage": "https://github.com/kroteau/scoop-chill",
     "license": "MIT",
-    "url": "https://github.com/kroteau/scoop-chill/archive/refs/tags/v0.0.1.zip",
-    "extract_dir": "scoop-chill-0.0.1",
+    "url": "https://github.com/kroteau/scoop-chill/archive/refs/tags/v0.0.2.zip",
+    "extract_dir": "scoop-chill-0.0.2",
+    "suggest": {
+        "Git (required to read bucket history)": [
+            "git",
+            "git-with-openssh"
+        ]
+    },
     "post_install": [
         "# Copied into the shims directory rather than shimmed. scoop's generated .ps1",
         "# shim carries a '$path = Join-Path $PSScriptRoot ...' line, and command_path",
