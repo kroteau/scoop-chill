@@ -1,10 +1,11 @@
 {
-    "version": "0.0.2",
+    "version": "0.0.3",
     "description": "Update apps only once their manifest has aged",
     "homepage": "https://github.com/kroteau/scoop-chill",
     "license": "MIT",
-    "url": "https://github.com/kroteau/scoop-chill/archive/refs/tags/v0.0.2.zip",
-    "extract_dir": "scoop-chill-0.0.2",
+    "url": "https://github.com/kroteau/scoop-chill/archive/refs/tags/v0.0.3.zip",
+    "hash": "6d5f7d64b23b6e3c20c38416f598c73589e3ef4850c306530d120d67ee238ee7",
+    "extract_dir": "scoop-chill-0.0.3",
     "suggest": {
         "Git (required to read bucket history)": [
             "git",
@@ -12,25 +13,13 @@
         ]
     },
     "post_install": [
-        "# Copied into the shims directory rather than shimmed. scoop's generated .ps1",
-        "# shim carries a '$path = Join-Path $PSScriptRoot ...' line, and command_path",
-        "# evaluates that line from lib\\commands.ps1, where $PSScriptRoot is scoop's lib",
-        "# directory - so a 'bin' entry would resolve to a path that does not exist.",
-        "# A raw scoop-*.ps1 has no $path line and command_path runs the file itself.",
+        "# Install raw command files because Scoop resolves generated PowerShell shims",
+        "# from its lib directory instead of the app directory for scoop subcommands.",
         "Copy-Item \"$dir\\scoop-chill.ps1\", \"$dir\\chill-lib.ps1\" (shimdir $false) -Force"
     ],
     "post_uninstall": [
-        "# Nothing is removed on update. post_install overwrites both copies in place,",
-        "# and no other scoop machinery touches them - rm_shims only removes shims scoop",
-        "# itself created from a 'bin' entry, and there is none. So an update that aborts",
-        "# on a failed download leaves the previous version installed and still working,",
-        "# rather than a shims directory with no command in it.",
-        "#",
-        "# The command and its state must survive an update and not survive an uninstall,",
-        "# and no hook argument distinguishes the two. $appDir is a local of",
-        "# scoop-uninstall.ps1 and exists nowhere in the update path, so its presence",
-        "# marks a real uninstall. Should scoop ever rename it, both merely outlive the",
-        "# app - neither is ever deleted mid-update.",
+        "# Scoop also runs post_uninstall during updates. Only scoop-uninstall.ps1",
+        "# defines $appDir, so remove the command and state only on actual uninstall.",
         "if ($null -ne $appDir) {",
         "    Remove-Item (Join-Path (shimdir $false) 'scoop-chill.ps1'), (Join-Path (shimdir $false) 'chill-lib.ps1') -Force -ErrorAction SilentlyContinue",
         "    Remove-Item \"$scoopdir\\persist\\scoop-chill\" -Recurse -Force -ErrorAction SilentlyContinue",
