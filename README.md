@@ -23,8 +23,8 @@ scoop install https://raw.githubusercontent.com/kroteau/scoop-chill/main/bucket/
 ```
 
 The release manifest downloads a tagged release archive. To install from a
-bucket, the referenced tag must exist. PowerShell 7 and Git are required; Git
-is used to read bucket history.
+bucket, the referenced tag must exist. PowerShell 5.1 or later and Git are
+required; Git is used to read bucket history.
 
 Scoop normally already provides Git for its buckets. If it is not available,
 install either `git` or the SSH-enabled variant:

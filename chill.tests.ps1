@@ -1,9 +1,16 @@
-#requires -Version 7
+#requires -Version 5.1
 # Self-checks for the chill engine. These exercise the pure decision core only,
 # so they load chill-lib.ps1 on its own, without scoop's libs or a scoop install.
 param([string]$Lib = "$PSScriptRoot\chill-lib.ps1")
 
 . $Lib
+
+# Keep the command entrypoint's syntax within its declared PowerShell baseline.
+# Scoop supplies $coreRoot, so parsing is the standalone check available here.
+$tokens = $null
+$parseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\scoop-chill.ps1", [ref]$tokens, [ref]$parseErrors) | Out-Null
+if ($parseErrors.Count -ne 0) { throw "regression: scoop-chill.ps1 does not parse: $($parseErrors.Message -join '; ')" }
 
 # Find-ChillManifest reaches for scoop's bucket helpers, which are absent here.
 # The missing-state check below only needs it to find nothing.
@@ -111,9 +118,14 @@ try {
     Set-ChillSetting 'Proxy' 'proxy.test:8080' $settingsDir
     Set-ChillSetting 'LastRefresh' '2026-08-20T01:02:03Z' $settingsDir
     $settings = Get-ChillSettings $settingsDir
+    if ($settings -isnot [hashtable]) { throw "regression: settings read as $($settings.GetType().Name), expected Hashtable" }
     if ($settings.Proxy -ne 'proxy.test:8080') { throw 'regression: refresh write erased proxy setting' }
     if ((ConvertTo-ChillDate $settings.LastRefresh).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') -ne '2026-08-20T01:02:03Z') {
         throw 'regression: proxy write erased refresh setting'
+    }
+    $bytes = [System.IO.File]::ReadAllBytes((Join-Path $settingsDir '_scoop_chill.json'))
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf) {
+        throw 'regression: state JSON was written with a UTF-8 BOM'
     }
 } finally {
     if (Test-Path $settingsDir) { Remove-Item $settingsDir -Recurse -Force }
@@ -159,15 +171,22 @@ foreach ($pair in @(
 # Bucket reset, against a throwaway repo rather than a real bucket: a modified
 # tracked file and an untracked one must both be reported, and both be gone
 # afterwards. Redefines the stubs above; every check that needed them has run.
-$repo = Join-Path ([System.IO.Path]::GetTempPath()) "chill-reset-$([guid]::NewGuid())"
+$repo = Join-Path ([System.IO.Path]::GetTempPath()) "chill reset $([guid]::NewGuid())"
 function Get-LocalBucket { @('testbucket') }
 function Find-BucketDirectory([string]$name, [switch]$Root) { $repo }
 try {
     New-Item $repo -ItemType Directory | Out-Null
     git -C $repo init -q
-    'tracked' | Set-Content "$repo\app.json"
+    Write-ChillUtf8 '{"version":"1.0"}' "$repo\app.json"
     git -C $repo add app.json
     git -C $repo -c user.email=t@t -c user.name=t commit -q -m add
+
+    # Exercise the history reader across a real redirected git process. The
+    # spaced repository path also verifies native argument quoting.
+    $hashes = [System.Collections.Generic.List[string]]::new()
+    $hashes.Add((git -C $repo rev-parse HEAD))
+    $versions = Get-ChillVersionsAt $repo 'app.json' $hashes
+    if ($versions[$hashes[0]] -ne '1.0') { throw "regression: version reader found '$($versions[$hashes[0]])', expected 1.0" }
 
     if (Get-ChillDirtyBucket) { throw 'regression: a clean bucket reported as dirty' }
 
@@ -178,7 +197,7 @@ try {
     if ($dirty[0].Changes.Count -ne 2) { throw "regression: expected 2 changes, got $($dirty[0].Changes.Count)" }
 
     if (-not (Reset-GitBucket $repo)) { throw 'regression: Reset-GitBucket reported failure' }
-    if ((Get-Content "$repo\app.json") -ne 'tracked') { throw 'regression: tracked file not restored' }
+    if ((Get-Content "$repo\app.json") -ne '{"version":"1.0"}') { throw 'regression: tracked file not restored' }
     if (Test-Path "$repo\leftover.json") { throw 'regression: untracked file not removed' }
     if (Get-ChillDirtyBucket) { throw 'regression: bucket still dirty after a reset' }
 } finally {

@@ -1,8 +1,7 @@
-#requires -Version 7
+#requires -Version 5.1
 # Engine for 'scoop chill': bucket git history, per-app state, and the age gate.
-# PowerShell 7 is required, not preferred: under 5.1 Get-ChillState's
-# ConvertFrom-Json -AsHashtable throws into its own catch and every app reads as
-# unknown state, silently discarding pins, holds, and first-seen dates.
+# The engine supports Scoop's Windows PowerShell 5.1 baseline as well as newer
+# PowerShell releases.
 #
 # Every name here carries a Chill noun. This file is dot-sourced into a scoop
 # command's scope, where an unprefixed Get-InstalledVersion or update would
@@ -23,6 +22,46 @@ function Reset-ChillCache {
 # sides block, no error, just a hang. Interleave reads before raising it that far.
 $script:ChillVersionChunkSize = 64
 $script:ChillLogPageSize      = 64
+
+#endregion
+
+#region PowerShell 5.1 compatibility
+
+# Normalize parsed JSON to the dictionary shape used by state consumers.
+function ConvertTo-ChillHashtable([object]$value) {
+    if ($null -eq $value) { return $null }
+    if ($value -is [System.Collections.IDictionary]) {
+        $table = @{}
+        foreach ($key in $value.Keys) { $table[$key] = ConvertTo-ChillHashtable $value[$key] }
+        return $table
+    }
+    if ($value -is [pscustomobject]) {
+        $table = @{}
+        foreach ($property in $value.PSObject.Properties) {
+            $table[$property.Name] = ConvertTo-ChillHashtable $property.Value
+        }
+        return $table
+    }
+    if ($value -is [System.Collections.IEnumerable] -and $value -isnot [string]) {
+        return @($value | ForEach-Object { ConvertTo-ChillHashtable $_ })
+    }
+    return $value
+}
+
+# Quote each native argument so paths and values survive a single command-line
+# string unchanged on every supported runtime.
+function ConvertTo-ChillNativeArgument([string]$value) {
+    if ($value.Length -gt 0 -and $value -notmatch '[\s"]') { return $value }
+    $escaped = [regex]::Replace($value, '(\\*)"', '$1$1\\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
+# Keep state files and temporary manifests in BOM-less UTF-8 on every runtime.
+function Write-ChillUtf8([string]$content, [string]$path) {
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($path, $content, $encoding)
+}
 
 #endregion
 
@@ -81,7 +120,7 @@ function Get-ChillVersionsAt([string]$root, [string]$relPath, [System.Collection
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = 'git'
-    foreach ($a in @('-C', $root, 'cat-file', '--batch')) { $psi.ArgumentList.Add($a) }
+    $psi.Arguments = (@('-C', $root, 'cat-file', '--batch') | ForEach-Object { ConvertTo-ChillNativeArgument $_ }) -join ' '
     $psi.RedirectStandardInput  = $true
     $psi.RedirectStandardOutput = $true
     $psi.UseShellExecute        = $false
@@ -89,7 +128,12 @@ function Get-ChillVersionsAt([string]$root, [string]$relPath, [System.Collection
 
     $proc = [System.Diagnostics.Process]::Start($psi)
     try {
-        foreach ($h in $hashes) { $proc.StandardInput.WriteLine("${h}:$relPath") }
+        # A sacrificial first query absorbs any BOM emitted by the framework's
+        # redirected input stream, keeping real object ids valid and aligned
+        # with the responses parsed below.
+        $queries = "chill-invalid-object`n" + (($hashes | ForEach-Object { "${_}:$relPath" }) -join "`n") + "`n"
+        $queryBytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($queries)
+        $proc.StandardInput.BaseStream.Write($queryBytes, 0, $queryBytes.Length)
         $proc.StandardInput.Close()
 
         $ms = [System.IO.MemoryStream]::new()
@@ -102,6 +146,9 @@ function Get-ChillVersionsAt([string]$root, [string]$relPath, [System.Collection
 
     $rx = [regex]'"version"\s*:\s*"([^"]*)"'
     $i  = 0
+    # Skip the sacrificial query's response before mapping hashes to results.
+    while ($i -lt $data.Length -and $data[$i] -ne 10) { $i++ }
+    if ($i -lt $data.Length) { $i++ }
     foreach ($h in $hashes) {
         if ($i -ge $data.Length) { $result[$h] = $null; continue }
         $lineStart = $i
@@ -275,12 +322,12 @@ function Write-ChillJson([object]$content, [string]$path) {
     # announcing a write that never landed. A name with a colon is worse than a
     # plain failure, since Set-Content writes it to an alternate data stream and
     # only Move-Item complains.
-    $content | ConvertTo-Json -Depth 5 | Set-Content $tmp -Encoding UTF8 -ErrorAction Stop
+    Write-ChillUtf8 ($content | ConvertTo-Json -Depth 5) $tmp
     Move-Item $tmp $path -Force -ErrorAction Stop
 }
 
 function Read-ChillJson([string]$path, [object]$fallback) {
-    if (Test-Path $path) { try { Get-Content $path -Raw | ConvertFrom-Json -AsHashtable } catch { $fallback } } else { $fallback }
+    if (Test-Path $path) { try { ConvertTo-ChillHashtable (Get-Content $path -Raw | ConvertFrom-Json) } catch { $fallback } } else { $fallback }
 }
 
 function Get-ChillState([string]$name, [string]$dir) {
@@ -498,7 +545,7 @@ function Invoke-ChillPinnedUpdate([string]$name, [string]$pinnedHash, [hashtable
     }
     try {
         $before = Select-CurrentVersion -AppName $name
-        $pinned | Set-Content $file.ManifestPath -Encoding UTF8
+        Write-ChillUtf8 ($pinned -join [Environment]::NewLine) $file.ManifestPath
         Invoke-ChillScoopUpdate $name $options
         # scoop's update reports nothing when it skips an app (e.g. still
         # running), so the installed version is the only reliable success signal.

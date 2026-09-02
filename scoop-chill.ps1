@@ -1,4 +1,4 @@
-#requires -Version 7
+#requires -Version 5.1
 # Usage: scoop chill [<subcommand>] [<apps>] [options]
 # Summary: Update apps only once their manifest has aged
 # Help: 'scoop chill' updates apps like 'scoop update', except an app is held
@@ -209,11 +209,17 @@ function Invoke-ChillRun([object[]]$rows) {
         if (Confirm-ChillWrite "record state for $($row.Name)") { Set-ChillState $row.Name $entry $stateDir }
     }
 
-    # Itself last. scoop's abort ends this script, so an update that fails takes
-    # the rest of the pass with it; going last means a failure of its own costs
-    # nothing else. Stable, to keep the order the report was sorted into.
+    # Update Chill itself last because Scoop may abort this script on failure.
+    # Preserve report order for every other app; the original index makes that
+    # ordering stable on every supported runtime.
+    $sortIndex = 0
     $toUpdate = @($rows | Where-Object { $_.Action -in 'Ready', 'Forced' } |
-        Sort-Object -Stable { $_.Name -eq 'scoop-chill' })
+        ForEach-Object {
+            [pscustomobject]@{ Row = $_; ChillLast = ($_.Name -eq 'scoop-chill'); Index = $sortIndex }
+            $sortIndex++
+        } |
+        Sort-Object ChillLast, Index |
+        ForEach-Object { $_.Row })
     if ($toUpdate.Count -eq 0) {
         Write-Host 'Nothing to update.' -ForegroundColor Green
         return
@@ -311,8 +317,10 @@ function Invoke-ChillProxyCommand([string[]]$arguments) {
             if (!$rest) { error 'Usage: scoop chill proxy set [<user>:<pass>@]<host>:<port> | none'; exit 1 }
             $address = ConvertTo-ChillProxyAddress $rest[0]
             if (!(Confirm-ChillWrite "set the proxy to $address")) { break }
-            Set-ChillSetting 'Proxy' ($rest[0] -eq 'none' ? $null : $address) $stateDir
-            success "Proxy $($rest[0] -eq 'none' ? 'cleared' : "set to $address")."
+            $proxyValue = if ($rest[0] -eq 'none') { $null } else { $address }
+            $proxyMessage = if ($rest[0] -eq 'none') { 'cleared' } else { "set to $address" }
+            Set-ChillSetting 'Proxy' $proxyValue $stateDir
+            success "Proxy $proxyMessage."
         }
         { $_ -in 'add', 'rm' } {
             if (!$rest) { error "Usage: scoop chill proxy $action <apps>"; exit 1 }
@@ -399,7 +407,8 @@ switch ($subCommand) {
             Reset-ChillCache
         }
 
-        $rows = Get-ChillReport $apps $minAge ($force ? $apps : @())
+        $forcedApps = if ($force) { $apps } else { @() }
+        $rows = Get-ChillReport $apps $minAge $forcedApps
         Show-ChillReport $rows
         Invoke-ChillRun $rows
     }
