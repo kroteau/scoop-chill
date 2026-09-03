@@ -1,11 +1,11 @@
 {
-    "version": "0.0.3",
+    "version": "0.0.4",
     "description": "Update apps only once their manifest has aged",
     "homepage": "https://github.com/kroteau/scoop-chill",
     "license": "MIT",
-    "url": "https://github.com/kroteau/scoop-chill/archive/refs/tags/v0.0.3.zip",
-    "hash": "6d5f7d64b23b6e3c20c38416f598c73589e3ef4850c306530d120d67ee238ee7",
-    "extract_dir": "scoop-chill-0.0.3",
+    "url": "https://github.com/kroteau/scoop-chill/archive/refs/tags/v0.0.4.zip",
+    "hash": "1af9670c94ba3290f05c8aaf3e4018170ff7ff8f633d94641a2e2ac4373dbd35",
+    "extract_dir": "scoop-chill-0.0.4",
     "suggest": {
         "Git (required to read bucket history)": [
             "git",
