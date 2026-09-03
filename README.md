@@ -38,11 +38,12 @@ scoop install git-with-openssh
 ## Usage
 
 ```powershell
-scoop chill                       # update eligible apps
+scoop chill                       # show the decision for each app; writes nothing
+scoop chill *                     # update all eligible apps
 scoop chill status                # show the decision for each app; writes nothing
 scoop chill firefox -f            # update one app regardless of its age or hold
-scoop chill -d                    # preview all writes without making them
-scoop chill -n                    # skip the Scoop/bucket refresh
+scoop chill * -d                  # preview all writes without making them
+scoop chill firefox -n            # skip the Scoop/bucket refresh
 
 scoop chill versions firefox      # show versions known to bucket history
 scoop chill versions firefox -c 10

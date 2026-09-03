@@ -6,9 +6,10 @@
 # one who finds out a release is broken. Held apps are held with scoop's own
 # hold, and released automatically once they age past the gate.
 #
-#     scoop chill                      update everything past the age gate
+#     scoop chill                      show the table, change nothing
+#     scoop chill *                    update everything past the age gate
 #     scoop chill firefox -f           ignore the gate for one app
-#     scoop chill status               show the table, change nothing
+#     scoop chill status [firefox]     show the table, change nothing
 #     scoop chill pin firefox 141.0    install that version when it has aged
 #     scoop chill pin firefox          pin the next version after the installed one
 #     scoop chill unpin firefox
@@ -85,6 +86,7 @@ $quiet     = $opt.q -or $opt.quiet
 $minAge    = if ($opt.a) { $opt.a } elseif ($opt.'min-age') { $opt.'min-age' } else { get_config CHILL_MIN_AGE_DAYS 7 }
 $count     = if ($opt.c) { $opt.c } elseif ($opt.count) { $opt.count } else { 5 }
 $apps      = @($apps)
+if ($apps.Count -eq 1 -and $apps[0] -eq '*') { $apps = @(installed_apps $false) }
 
 if (!(Test-GitAvailable)) {
     error 'git is required to read bucket history. Run: scoop install git'
@@ -392,6 +394,10 @@ switch ($subCommand) {
     }
     default {
         if ($force -and !$apps) { error '--force needs an app name.'; exit 1 }
+        if (!$apps) {
+            Show-ChillReport (Get-ChillReport @() $minAge @())
+            break
+        }
 
         $refreshMaxAge = get_config CHILL_REFRESH_MAX_AGE_HOURS 1
         $lastRefresh   = ConvertTo-ChillDate (Get-ChillSettings $stateDir)['LastRefresh']
