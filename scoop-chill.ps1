@@ -229,8 +229,8 @@ function Invoke-ChillRun([object[]]$rows) {
 
     $proxyUrl = (Get-ChillSettings $stateDir)['Proxy']
     if (!$proxyUrl -and @($toUpdate | Where-Object Proxy -EQ '*')) {
-        warn "Proxy apps are ready but no url is stored. Run: scoop chill proxy set <url>"
-        return
+        warn "Proxy apps are ready but no url is stored; skipping them. Run: scoop chill proxy set <url>"
+        $toUpdate = @($toUpdate | Where-Object Proxy -NE '*')
     }
 
     foreach ($row in $toUpdate) {
