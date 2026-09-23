@@ -9,6 +9,7 @@
 #     scoop chill                      show the table, change nothing
 #     scoop chill *                    update everything past the age gate
 #     scoop chill firefox -f           ignore the gate for one app
+#     scoop chill firefox@141.0        update using that version's Git manifest
 #     scoop chill status [firefox]     show the table, change nothing
 #     scoop chill pin firefox 141.0    install that version when it has aged
 #     scoop chill pin firefox          pin the next version after the installed one
@@ -132,7 +133,9 @@ function Get-ChillReport([string[]]$named, [int]$minAgeDays, [string[]]$forced) 
     $rows   = [System.Collections.Generic.List[object]]::new()
     $index  = 0
 
-    foreach ($name in $names) {
+    foreach ($target in @(ConvertTo-ChillTargets $names)) {
+        $name     = $target.Name
+        $isForced = $name -in $forced -or $target.Argument -in $forced
         $index++
         Write-Progress -Activity 'Checking apps' -Status $name -PercentComplete ($index / [Math]::Max($names.Count, 1) * 100)
 
@@ -159,39 +162,66 @@ function Get-ChillReport([string[]]$named, [int]$minAgeDays, [string[]]$forced) 
         if (!$status.installed) { warn "'$name' isn't installed."; continue }
         $stored = Get-ChillState $name $stateDir
         $isPinned = $stored -and $stored['PinnedVersion']
-        if (!$status.outdated -and !$isPinned -and $name -notin $forced) { continue }
+        if (!$status.outdated -and !$isPinned -and !$isForced -and !$target.Version) { continue }
 
-        $file     = Find-ChillManifest $name
-        $latest   = if ($status.latest_version) { $status.latest_version } else { $status.version }
-        $entry    = Resolve-ChillEntry $name $latest (Get-ChillManifestDate $file) $file $stored $now
-        $decision = Get-ChillDecision $entry (@{ name = $name } + $status) $cutoff ([bool]($name -in $forced))
+        $file      = Find-ChillManifest $name
+        $latest    = if ($status.latest_version) { $status.latest_version } else { $status.version }
+        $requested = $null
+        if ($target.Version) {
+            if ((install_info $name $status.version $false).url) {
+                Write-Warning "${name}: version targets require a bucket-installed app; skipping URL install"
+                continue
+            }
+            $requested = Find-ChillVersionCommit $target.Version $file
+            if (!$requested.Hash -or !$requested.Date) {
+                Write-Warning "${name}: version $($target.Version) not found with a date in bucket history; skipping"
+                continue
+            }
+        }
+        $entry = Resolve-ChillEntry $name $latest (Get-ChillManifestDate $file) $file $stored $now ([bool]$target.Version)
+        $decisionEntry = $entry
+        if ($target.Version) {
+            # The target is transient; persist latest's history and the user's pin unchanged.
+            $decisionEntry = $entry.Clone()
+            $decisionEntry.PinnedVersion = $target.Version
+            $decisionEntry.PinnedDate = $requested.Date
+            $decisionEntry.Repushed = $false
+        }
+        $decision = Get-ChillDecision $decisionEntry (@{ name = $name } + $status) $cutoff $isForced
+        if ($target.Version -and $status.version -eq $target.Version) {
+            $decision.Action = 'Current'
+            $decision.Ready = $false
+        }
 
         $age = if ($decision.Gate) { [int][math]::Floor(($now - $decision.Gate).TotalDays) } else { 0 }
         $rows.Add([pscustomobject]@{
-            Name         = $name
-            Installed    = $status.version
-            Latest       = $latest
-            'First Seen' = $entry.FirstSeen.ToString('yyyy-MM-dd')
-            Age          = $age
-            Proxy        = if ($entry['Proxy']) { '*' } else { '' }
-            Pin          = if ($entry['PinnedVersion']) { $entry['PinnedVersion'] } else { '' }
-            Action       = $decision.Action
-            Entry        = $entry
-            Decision     = $decision
+            Name          = $name
+            Installed     = $status.version
+            Latest        = $latest
+            TargetVersion = $target.Version
+            TargetHash    = if ($requested) { $requested.Hash } else { $null }
+            TargetFile    = if ($requested) { $file } else { $null }
+            'First Seen'  = if ($requested) { $requested.Date.ToString('yyyy-MM-dd') } else { $entry.FirstSeen.ToString('yyyy-MM-dd') }
+            Age           = $age
+            Proxy         = if ($entry['Proxy']) { '*' } else { '' }
+            Pin           = if ($entry['PinnedVersion']) { $entry['PinnedVersion'] } else { '' }
+            Action        = $decision.Action
+            Entry         = $entry
+            Decision      = $decision
         })
     }
 
     Write-Progress -Activity 'Checking apps' -Completed
     # Actionable rows last, next to the summary line under the table.
-    return @($rows | Sort-Object { @('Failed', 'Held', 'ManualHold', 'Ready', 'Forced').IndexOf($_.Action) }, Age)
+    return @($rows | Sort-Object { @('Failed', 'Current', 'Held', 'ManualHold', 'Ready', 'Forced').IndexOf($_.Action) }, Age)
 }
 
 function Show-ChillReport([object[]]$rows) {
     $rows = @($rows | Where-Object Action -NE 'Repushed')
-    $rows | Format-Table -AutoSize -Property Name, Installed, Latest, 'First Seen', Age, Proxy, Pin, Action
+    $rows | Format-Table -AutoSize -Property Name, Installed, Latest, @{ Label = 'Target'; Expression = { $_.TargetVersion } }, 'First Seen', Age, Proxy, Pin, Action
     $ready  = @($rows | Where-Object { $_.Action -in 'Ready', 'Forced' })
     $proxied = @($ready | Where-Object Proxy -EQ '*').Count
-    $pinned  = @($ready | Where-Object Pin -NE '').Count
+    $pinned  = @($ready | Where-Object { !$_.TargetVersion -and $_.Pin -ne '' }).Count
     $held    = @($rows | Where-Object Action -EQ 'Held').Count
     $manual  = @($rows | Where-Object Action -EQ 'ManualHold').Count
     $failed  = @($rows | Where-Object Action -EQ 'Failed')
@@ -203,7 +233,7 @@ function Show-ChillReport([object[]]$rows) {
 
 function Invoke-ChillRun([object[]]$rows) {
     foreach ($row in $rows) {
-        if ($row.Action -eq 'Failed') { continue }
+        if ($row.Action -in 'Failed', 'Current') { continue }
         $entry = $row.Entry
         if ($row.Decision.Ready -and $entry.ScriptHeld) {
             if ((Confirm-ChillWrite "unhold $($row.Name)") -and (Set-ChillHold $row.Name $false)) { $entry.ScriptHeld = $false }
@@ -239,7 +269,8 @@ function Invoke-ChillRun([object[]]$rows) {
         $verb  = if ($row.Action -eq 'Forced') { 'force-update' } else { 'update' }
         $label = if ($row.Action -eq 'Forced') { 'Force-updating' } else { 'Updating' }
         $notes = @()
-        if ($row.Pin -ne '') { $notes += "pinned $($row.Pin)" }
+        if ($row.TargetVersion) { $notes += "version $($row.TargetVersion)" }
+        elseif ($row.Pin -ne '') { $notes += "pinned $($row.Pin)" }
         if ($row.Proxy -eq '*') { $notes += 'proxy' }
         $tag = if ($notes) { " ($($notes -join ', '))" } else { '' }
         if (!(Confirm-ChillWrite "$verb $($row.Name)$tag")) { continue }
@@ -401,6 +432,7 @@ switch ($subCommand) {
             break
         }
 
+        ConvertTo-ChillTargets $apps | Out-Null
         $refreshMaxAge = get_config CHILL_REFRESH_MAX_AGE_HOURS 1
         $lastRefresh   = ConvertTo-ChillDate (Get-ChillSettings $stateDir)['LastRefresh']
         $stale = $null -eq $lastRefresh -or ($now - $lastRefresh).TotalHours -gt $refreshMaxAge

@@ -42,6 +42,8 @@ scoop chill                       # show the decision for each app; writes nothi
 scoop chill *                     # update all eligible apps
 scoop chill status                # show the decision for each app; writes nothing
 scoop chill firefox -f            # update one app regardless of its age or hold
+scoop chill claude-code@2.1.280    # update to an exact version from bucket history
+scoop chill claude-code@2.1.280 -f # bypass the target version's age gate and holds
 scoop chill * -d                  # preview all writes without making them
 scoop chill firefox -n            # skip the Scoop/bucket refresh
 
@@ -63,6 +65,18 @@ scoop chill reset extras          # do so only in the extras bucket
 directories. Review its output, or use `-d` first, before running it.
 
 ## How the gate works
+
+`<app>@<version>` selects the original manifest from that version's most recent
+run in the installed bucket's Git history. No manifest is generated. The target's
+age gate and manual holds still apply unless `-f` is used; upgrades and downgrades
+are supported. An already-installed target is a no-op, including with `-f`.
+Unknown versions and URL-installed apps are skipped with a warning.
+
+This target applies only to the current invocation: existing pins are preserved
+and automatic pinning is suppressed for that app. Later ordinary updates resume
+normal pin and age-gate behavior. A historical target uses the original commit,
+even if that version was subsequently re-pushed. The bucket manifest is restored
+after the update; a manifest with local changes is left untouched.
 
 For each outdated app (and for explicit pins), chill finds the first commit in
 the installed bucket where the target version appeared. The app is eligible

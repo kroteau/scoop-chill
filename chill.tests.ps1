@@ -286,6 +286,141 @@ try {
 'ok: a dirty bucket is detected and reset to HEAD'
 
 & {
+    $ErrorActionPreference = 'Stop'
+    . $Lib
+    $targets = @(ConvertTo-ChillTargets @('claude-code@2.1.280', 'ordinary'))
+    if ($targets[0].Name -ne 'claude-code' -or $targets[0].Version -ne '2.1.280' -or $targets[1].Version) {
+        throw 'regression: app/version parsing failed'
+    }
+    foreach ($bad in @('app@', '@1.0', 'app@1@2', '*@1.0', '../app@1.0')) {
+        $rejected = $false
+        try { ConvertTo-ChillTargets @($bad) | Out-Null } catch { $rejected = $true }
+        if (!$rejected) { throw "regression: accepted invalid target $bad" }
+    }
+    $rejected = $false
+    try { ConvertTo-ChillTargets @('app@1.0', 'APP@2.0') | Out-Null } catch { $rejected = $true }
+    if (!$rejected) { throw 'regression: conflicting targets accepted' }
+    'ok: version target parsing rejects malformed and duplicate app arguments'
+
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\scoop-chill.ps1", [ref]$null, [ref]$null)
+    foreach ($name in @('Get-ChillReport', 'Show-ChillReport', 'Invoke-ChillRun', 'Confirm-ChillWrite')) {
+        $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $false)
+        . ([scriptblock]::Create($definition.Extent.Text))
+    }
+    $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "chill-version-$([guid]::NewGuid())"
+    $repo = Join-Path $testRoot 'bucket'
+    $stateDir = Join-Path $testRoot 'state'
+    $now = [datetime]'2026-09-24T12:00:00Z'
+    $dryRun = $false
+    $updateOptions = @{}
+    $fixture = @{ Installed = '3.0'; Hold = $false; Url = $null; Fail = $false; Skip = $false }
+    $updates = [System.Collections.Generic.List[object]]::new()
+    function Get-LocalBucket { @('fixture') }
+    function Find-BucketDirectory { $repo }
+    function Select-CurrentVersion { $fixture.Installed }
+    function install_info { @{ bucket = 'fixture'; url = $fixture.Url } }
+    function app_status($name) {
+        if ($name -ne 'app') { throw "regression: installed lookup received $name" }
+        @{ installed = $true; outdated = ($fixture.Installed -ne '3.0'); version = $fixture.Installed; latest_version = '3.0'; hold = $fixture.Hold }
+    }
+    function Set-ChillHold($name, $held) { $fixture.Hold = $held; return $true }
+    function Invoke-ChillScoopUpdate($name, $options) {
+        $manifest = Get-Content "$repo\app.json" -Raw | ConvertFrom-Json
+        $updates.Add($manifest)
+        if ($fixture.Fail) { throw 'simulated update failure' }
+        if (!$fixture.Skip) { $fixture.Installed = $manifest.version }
+    }
+    function error($message) { throw $message }
+    function Commit-VersionFixture($version, $hash, $date) {
+        Write-ChillUtf8 "{`"version`":`"$version`",`"hash`":`"$hash`"}" "$repo\app.json"
+        git -C $repo add app.json
+        git -C $repo -c user.name=test -c user.email=test@example.invalid commit -q --date=$date -m $hash
+        if ($LASTEXITCODE -ne 0) { throw 'version fixture commit failed' }
+        Reset-ChillCache
+    }
+    try {
+        New-Item $repo -ItemType Directory -Force | Out-Null
+        git -C $repo init -q
+        Commit-VersionFixture '1.0' 'original' '2026-08-01T12:00:00Z'
+        Commit-VersionFixture '1.0' 'repushed' '2026-08-02T12:00:00Z'
+        Commit-VersionFixture '2.0' 'middle' '2026-09-01T12:00:00Z'
+        Commit-VersionFixture '3.0' 'latest' '2026-09-23T12:00:00Z'
+        $latestHash = (Get-FileHash "$repo\app.json").Hash
+
+        $rows = @(Get-ChillReport @('app@2.0') 7 @())
+        if ($rows.Count -ne 1 -or $rows[0].Action -ne 'Ready' -or $rows[0].TargetVersion -ne '2.0') { throw 'regression: historical downgrade not ready' }
+        $display = Show-ChillReport $rows 6>&1 | Out-String
+        if ($display -notmatch 'Target' -or $display -notmatch '2.0') { throw 'regression: requested version missing from report' }
+        $dryRun = $true
+        Invoke-ChillRun $rows
+        if ($updates.Count -or (Test-Path $stateDir) -or $fixture.Hold) { throw 'regression: version dry-run changed state' }
+        $dryRun = $false
+        Invoke-ChillRun $rows
+        if ($fixture.Installed -ne '2.0' -or $updates[-1].hash -ne 'middle') { throw 'regression: historical manifest not used' }
+        if ((Get-FileHash "$repo\app.json").Hash -ne $latestHash) { throw 'regression: manifest not restored' }
+        $saved = Get-ChillState 'app' $stateDir
+        if ($saved.Version -ne '3.0' -or $saved.PinnedVersion) { throw 'regression: direct target persisted as latest or pin' }
+
+        $calls = $updates.Count
+        $beforeState = (Get-FileHash "$stateDir\app.json").Hash
+        $current = @(Get-ChillReport @('app@2.0') 7 @('app@2.0'))
+        if ($current[0].Action -ne 'Current') { throw 'regression: installed target not reported as current' }
+        Invoke-ChillRun $current
+        if ($updates.Count -ne $calls -or (Get-FileHash "$stateDir\app.json").Hash -ne $beforeState) { throw 'regression: current target caused writes' }
+
+        $young = @(Get-ChillReport @('app@3.0') 7 @())
+        if ($young[0].Action -ne 'Held') { throw 'regression: target age gate ignored' }
+        $fixture.Hold = $true
+        $held = @(Get-ChillReport @('app@1.0') 7 @())
+        if ($held[0].Action -ne 'ManualHold') { throw 'regression: version target ignored manual hold' }
+        $forced = @(Get-ChillReport @('app@3.0') 7 @('app@3.0'))
+        if ($forced[0].Action -ne 'Forced') { throw 'regression: version force did not bypass age/hold' }
+        Invoke-ChillRun $forced
+        if ($fixture.Installed -ne '3.0' -or $fixture.Hold) { throw 'regression: forced target did not install or unhold' }
+
+        Set-ChillPin 'app' '2.0' $stateDir
+        Invoke-ChillRun @(Get-ChillReport @('app@1.0') 7 @())
+        if ($fixture.Installed -ne '1.0' -or $updates[-1].hash -ne 'original') { throw 'regression: target did not use original version commit' }
+        if ((Get-ChillState 'app' $stateDir).PinnedVersion -ne '2.0') { throw 'regression: target changed persistent pin' }
+
+        Clear-ChillPin 'app' $stateDir
+        $saved = Get-ChillState 'app' $stateDir
+        $saved.Version = '1.0'
+        $saved.ScriptHeld = $true
+        $saved.Repushed = $false
+        Set-ChillState 'app' $saved $stateDir
+        $rows = @(Get-ChillReport @('app@2.0') 7 @())
+        if ($rows[0].Entry.PinnedVersion) { throw 'regression: direct target created an automatic pin' }
+
+        $missing = @(Get-ChillReport @('app@9.0') 7 @('app@9.0') -WarningVariable warnings 3>$null)
+        if ($missing.Count -or !$warnings) { throw 'regression: missing target fell back to latest' }
+        $fixture.Url = 'https://example.invalid/app.json'
+        if (@(Get-ChillReport @('app@2.0') 7 @() 3>$null).Count) { throw 'regression: URL install accepted historical target' }
+        $fixture.Url = $null
+
+        $fixture.Fail = $true
+        $failed = $false
+        try { Invoke-ChillAppUpdate $rows[0] $stateDir @{} } catch { $failed = $true }
+        if (!$failed -or (Get-FileHash "$repo\app.json").Hash -ne $latestHash) { throw 'regression: failed update did not restore manifest' }
+        $fixture.Fail = $false
+        $fixture.Skip = $true
+        $applied = Invoke-ChillPinnedUpdate 'app' $rows[0].TargetHash $rows[0].TargetFile @{} -WarningVariable warnings 3>$null
+        if ($applied -or !$warnings) { throw 'regression: skipped update reported success' }
+        $fixture.Skip = $false
+        Write-ChillUtf8 '{"version":"local-edit"}' "$repo\app.json"
+        $calls = $updates.Count
+        Invoke-ChillAppUpdate $rows[0] $stateDir @{} 3>$null
+        if ($updates.Count -ne $calls -or (Get-Content "$repo\app.json" -Raw) -notmatch 'local-edit') { throw 'regression: dirty manifest was overwritten' }
+        'ok: version targets preserve pins, respect gates, use real historical manifests, and restore bucket files'
+    } finally {
+        $resolved = [System.IO.Path]::GetFullPath($testRoot)
+        $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (!$resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'unsafe version fixture cleanup path' }
+        if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }
+    }
+}
+
+& {
     # Real bucket history and state; Scoop installation/update operations are mocked.
     $ErrorActionPreference = 'Stop'
     . $Lib

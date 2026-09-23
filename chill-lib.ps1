@@ -393,8 +393,22 @@ function Resolve-ChillNextPin([string]$name) {
 
 #region Decisions
 
+function ConvertTo-ChillTargets([string[]]$arguments) {
+    $seen = @{}
+    foreach ($argument in $arguments) {
+        if ($argument -notmatch '^(?<name>[^@\s/\\:]+)(?:@(?<version>[^@\s/\\:]+))?$' -or $argument.Contains('*')) {
+            throw "Invalid app target '$argument'; use <app> or <app>@<version>."
+        }
+        $name    = $Matches.name
+        $version = $Matches.version
+        if ($seen.ContainsKey($name)) { throw "App '$name' was specified more than once." }
+        $seen[$name] = $true
+        [pscustomobject]@{ Name = $name; Version = $version; Argument = $argument }
+    }
+}
+
 # Merge stored state with current bucket facts into a full entry.
-function Resolve-ChillEntry([string]$name, [string]$latest, [nullable[datetime]]$manifestDate, [hashtable]$file, [hashtable]$stored, [datetime]$now) {
+function Resolve-ChillEntry([string]$name, [string]$latest, [nullable[datetime]]$manifestDate, [hashtable]$file, [hashtable]$stored, [datetime]$now, [bool]$skipAutoPin = $false) {
     if ($stored -and $stored.Version -eq $latest) {
         $entry = @{
             Version       = $stored.Version
@@ -430,7 +444,7 @@ function Resolve-ChillEntry([string]$name, [string]$latest, [nullable[datetime]]
             $entry['PinnedVersion'] = $stored['PinnedVersion']
             $entry['PinnedHash']    = $stored['PinnedHash']
             $entry['PinnedDate']    = ConvertTo-ChillDate $stored['PinnedDate']
-        } elseif ($stored -and $stored['ScriptHeld'] -and $stored['Version'] -and -not $stored['Repushed']) {
+        } elseif (!$skipAutoPin -and $stored -and $stored['ScriptHeld'] -and $stored['Version'] -and -not $stored['Repushed']) {
             # Latest moved past a version we were holding: pin to that version so
             # the upgrade path goes through it first.
             $pinCommit = Find-ChillVersionCommit $stored['Version'] $file
@@ -557,19 +571,18 @@ function Invoke-ChillPinnedUpdate([string]$name, [string]$pinnedHash, [hashtable
         return $false
     }
     try {
-        $before = Select-CurrentVersion -AppName $name
+        $expected = ($pinned -join [Environment]::NewLine | ConvertFrom-Json).version
         Write-ChillUtf8 ($pinned -join [Environment]::NewLine) $file.ManifestPath
         Invoke-ChillScoopUpdate $name $options
-        # scoop's update reports nothing when it skips an app (e.g. still
-        # running), so the installed version is the only reliable success signal.
-        # Keep the pin otherwise, or the retry is lost.
-        if ((Select-CurrentVersion -AppName $name) -eq $before) {
-            Write-Warning "$($name): update did not apply, keeping pin"
+        # Scoop can return without updating (e.g. when the app is running).
+        if ((Select-CurrentVersion -AppName $name) -ne $expected) {
+            Write-Warning "$($name): requested $expected was not installed; keeping any existing pin"
             return $false
         }
         return $true
     } finally {
         git -C $file.BucketRoot checkout HEAD -- $file.RelPath 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "${name}: could not restore bucket manifest $($file.ManifestPath)" }
         # The restored manifest is a different blob on disk; drop the memoized log.
         Reset-ChillCache
     }
@@ -585,6 +598,10 @@ function Invoke-ChillScoopUpdate([string]$name, [hashtable]$options) {
 # decision pass.
 function Invoke-ChillAppUpdate([object]$result, [string]$dir, [hashtable]$options) {
     if ($result.Action -eq 'Forced') { Set-ChillHold $result.Name $false | Out-Null }
+    if ($result.TargetVersion) {
+        Invoke-ChillPinnedUpdate $result.Name $result.TargetHash $result.TargetFile $options | Out-Null
+        return
+    }
     if ($result.Pin -eq '') {
         Invoke-ChillScoopUpdate $result.Name $options
         return
