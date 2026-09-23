@@ -25,7 +25,10 @@
         "    Remove-Item \"$scoopdir\\persist\\scoop-chill\" -Recurse -Force -ErrorAction SilentlyContinue",
         "}"
     ],
-    "checkver": "github",
+    "checkver": {
+        "url": "https://github.com/kroteau/scoop-chill/tags",
+        "regex": "/releases/tag/v([0-9]+\\.[0-9]+\\.[0-9]+)\""
+    },
     "autoupdate": {
         "url": "https://github.com/kroteau/scoop-chill/archive/refs/tags/v$version.zip",
         "extract_dir": "scoop-chill-$version"

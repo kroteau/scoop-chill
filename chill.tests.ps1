@@ -1,6 +1,5 @@
 #requires -Version 5.1
-# Self-checks for the chill engine. These exercise the pure decision core only,
-# so they load chill-lib.ps1 on its own, without scoop's libs or a scoop install.
+# Self-checks for the chill engine, using temporary state and mocked Scoop calls.
 param([string]$Lib = "$PSScriptRoot\chill-lib.ps1")
 
 . $Lib
@@ -98,6 +97,84 @@ if ($autoPin.PinnedVersion -ne '1.0') { throw "regression: auto-pin missing, Pin
 if ($autoPin.Version -ne '2.0') { throw "regression: entry version is '$($autoPin.Version)', expected 2.0" }
 
 'ok: decision core - age boundary, force, pin gating, auto-pin'
+
+$repushedEntry = Resolve-ChillEntry 'testpkg' '1.0' $now.AddDays(-10) $null $stored $now
+if (-not $repushedEntry.Repushed) { throw 'regression: re-push not detected' }
+$repushDir = Join-Path ([System.IO.Path]::GetTempPath()) "chill-repush-$([guid]::NewGuid())"
+try {
+    Set-ChillState 'testpkg' $repushedEntry $repushDir
+    $saved = Get-ChillState 'testpkg' $repushDir
+    $again = Resolve-ChillEntry 'testpkg' '1.0' $now.AddDays(-10) $null $saved $now
+    $d = Get-ChillDecision $again $plain $cutoff $false
+    if ($d.Action -ne 'Repushed' -or $d.Ready) { throw 'regression: re-push became eligible on the next run' }
+    if ((Get-ChillDecision $again $plain $cutoff $true).Action -ne 'Forced') { throw 'regression: force did not bypass re-push block' }
+    $saved.ScriptHeld = $true
+    $next = Resolve-ChillEntry 'testpkg' '2.0' $null $null $saved $now
+    if ($next.Repushed -or $next.PinnedVersion) { throw 'regression: blocked version carried forward into a newer release' }
+    $again.PinnedVersion = '0.9'
+    $again.PinnedDate = $now.AddDays(-30)
+    if ((Get-ChillDecision $again $plain $cutoff $false).Action -ne 'Ready') { throw 'regression: re-push blocked a different pinned version' }
+    $again.PinnedVersion = '1.0'
+    if ((Get-ChillDecision $again $plain $cutoff $false).Action -ne 'Repushed') { throw 'regression: pin bypassed the re-push block' }
+} finally {
+    $resolved = [System.IO.Path]::GetFullPath($repushDir)
+    if (-not $resolved.StartsWith([System.IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase)) { throw 'unexpected test directory' }
+    if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }
+}
+'ok: re-push block persists, requires force, and resets for a new version'
+
+& {
+    function Find-ChillVersionCommit { @{ Hash = 'test'; Date = $now.AddDays(-30) } }
+    $legacy = @{ Version = '1.0'; FirstSeen = $now.AddDays(-30); UpdatedAt = $now.AddDays(-10) }
+    foreach ($previous in @($null, $legacy)) {
+        $found = Resolve-ChillEntry 'testpkg' '1.0' $now.AddDays(-10) @{} $previous $now
+        if (-not $found.Repushed) { throw 'regression: history did not detect a previously observed re-push' }
+    }
+    $fresh = Resolve-ChillEntry 'testpkg' '1.0' $now.AddDays(-30) @{} $null $now
+    if ($fresh.Repushed) { throw 'regression: unchanged manifest classified as re-pushed' }
+}
+
+& {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\scoop-chill.ps1", [ref]$null, [ref]$null)
+    $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Show-ChillReport' }, $false)
+    . ([scriptblock]::Create($definition.Extent.Text))
+    $output = Show-ChillReport @(
+        [pscustomobject]@{ Name = 'hidden-repush'; Action = 'Repushed' },
+        [pscustomobject]@{ Name = 'visible-forced'; Action = 'Forced'; Proxy = ''; Pin = '' }
+    ) 6>&1 | Out-String
+    if ($output -match 'hidden-repush' -or $output -notmatch 'visible-forced') { throw 'regression: report did not hide only the blocked update' }
+}
+'ok: history detects legacy re-pushes and the report hides blocked updates'
+
+& {
+    function Find-ChillVersionCommit { throw 'regression: cached discovery walked version history' }
+    $date = $now.AddDays(-30)
+    $cached = @{ Version = '1.0'; VersionHash = 'known-introduction'; FirstSeen = $date; UpdatedAt = $date; Repushed = $false }
+    $unchanged = Resolve-ChillEntry 'testpkg' '1.0' $date @{} $cached $now
+    if ($unchanged.Repushed) { throw 'regression: unchanged cached version blocked' }
+    $changed = Resolve-ChillEntry 'testpkg' '1.0' $date.AddDays(1) @{} $cached $now
+    if (-not $changed.Repushed) { throw 'regression: changed cached version not blocked' }
+    $legacy = $cached.Clone()
+    $legacy.Remove('Repushed')
+    $legacy.UpdatedAt = $date.AddDays(1)
+    $changed = Resolve-ChillEntry 'testpkg' '1.0' $date.AddDays(1) @{} $legacy $now
+    if (-not $changed.Repushed) { throw 'regression: legacy cached introduction did not detect re-push' }
+}
+& {
+    $calls = [System.Collections.Generic.List[string]]::new()
+    function Find-ChillVersionCommit {
+        $calls.Add('lookup')
+        @{ Hash = 'introduction'; Date = $now.AddDays(-30) }
+    }
+    $fresh = Resolve-ChillEntry 'testpkg' '1.0' $now.AddDays(-30) @{} $null $now
+    if ($calls.Count -ne 1) { throw 'regression: first discovery resolved version history more than once' }
+    $calls.Clear()
+    $legacy = @{ Version = '1.0'; FirstSeen = $now; UpdatedAt = $now.AddDays(-30) }
+    $migrated = Resolve-ChillEntry 'testpkg' '1.0' $now.AddDays(-30) @{} $legacy $now
+    $again = Resolve-ChillEntry 'testpkg' '1.0' $now.AddDays(-30) @{} $migrated $now
+    if ($calls.Count -ne 1 -or $again.Repushed) { throw 'regression: missing hash was not backfilled for reuse' }
+}
+'ok: cached discovery performs zero history lookups; new and legacy versions resolve once'
 
 # The proxy flag survives a state round-trip through Resolve-ChillEntry, on both
 # the same-version path and the new-version path.
@@ -207,3 +284,81 @@ try {
 }
 
 'ok: a dirty bucket is detected and reset to HEAD'
+
+& {
+    # Real bucket history and state; Scoop installation/update operations are mocked.
+    $ErrorActionPreference = 'Stop'
+    . $Lib
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\scoop-chill.ps1", [ref]$null, [ref]$null)
+    foreach ($name in @('Get-ChillReport', 'Show-ChillReport', 'Invoke-ChillRun', 'Confirm-ChillWrite')) {
+        $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $false)
+        . ([scriptblock]::Create($definition.Extent.Text))
+    }
+    $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "chill-repush-flow-$([guid]::NewGuid())"
+    $repo = Join-Path $testRoot 'bucket'
+    $stateDir = Join-Path $testRoot 'state'
+    $now = [datetime]'2026-09-20T12:00:00'
+    $dryRun = $false
+    $updateOptions = @{}
+    $updates = [System.Collections.Generic.List[string]]::new()
+    $holds = @{}
+    function Get-LocalBucket { @('fixture') }
+    function Find-BucketDirectory { $repo }
+    function Select-CurrentVersion { '1.26.0' }
+    function install_info { @{ bucket = 'fixture' } }
+    function installed_apps { @('go', 'ordinary') }
+    function app_status($name) {
+        @{ installed = $true; outdated = $true; version = '1.26.0'; latest_version = '1.27.1'; hold = [bool]$holds[$name] }
+    }
+    function Set-ChillHold($name, $held) { $holds[$name] = $held; return $true }
+    function Invoke-ChillScoopUpdate($name, $options) { $updates.Add($name) }
+    function error($message) { throw $message }
+    function Commit-Fixture($date, $message) {
+        git -C $repo add .
+        git -C $repo -c user.name=test -c user.email=test@example.invalid commit -q --date=$date -m $message
+        if ($LASTEXITCODE -ne 0) { throw 'fixture commit failed' }
+        Reset-ChillCache
+    }
+    try {
+        New-Item $repo -ItemType Directory -Force | Out-Null
+        git -C $repo init -q
+        Write-ChillUtf8 '{"version":"1.27.1","hash":"original"}' "$repo\go.json"
+        Write-ChillUtf8 '{"version":"1.27.1","hash":"unchanged"}' "$repo\ordinary.json"
+        Commit-Fixture '2026-09-01T23:28:00+03:00' 'initial versions'
+        $originalHash = git -C $repo rev-parse HEAD
+        Write-ChillUtf8 '{"version":"1.27.1","hash":"replacement"}' "$repo\go.json"
+        Commit-Fixture '2026-09-05T09:06:00+03:00' 'repush go without changing version'
+
+        if (Test-Path $stateDir) { throw 'fixture unexpectedly has state' }
+        $rows = @(Get-ChillReport (installed_apps) 7 @())
+        $go = $rows | Where-Object Name -EQ 'go'
+        if ($go.Action -ne 'Repushed') { throw 'Go was not blocked on first run without state' }
+        $display = Show-ChillReport $rows 6>&1 | Out-String
+        if ($display -match '\bgo\b' -or $display -notmatch 'ordinary') { throw 'normal report did not hide Go' }
+        Invoke-ChillRun $rows
+        if (($updates -join ',') -ne 'ordinary') { throw "normal flow updated unexpected apps: $updates" }
+        $saved = Get-ChillState 'go' $stateDir
+        if (-not $saved.Repushed -or $saved.VersionHash -ne $originalHash) { throw 're-push flag or version introduction hash not saved' }
+        'ok: no prior state/hash: normal flow hides and skips Go, updates ordinary, saves block and hash'
+
+        $updates.Clear()
+        Reset-ChillCache
+        Invoke-ChillRun @(Get-ChillReport (installed_apps) 7 @())
+        if (($updates -join ',') -ne 'ordinary') { throw 'second run allowed re-pushed Go' }
+        'ok: persisted block survives a second normal update run'
+
+        $updates.Clear()
+        $dryRun = $true
+        Invoke-ChillRun @(Get-ChillReport @('go') 7 @('go'))
+        if ($updates.Count) { throw 'forced dry-run called the updater' }
+        $dryRun = $false
+        Invoke-ChillRun @(Get-ChillReport @('go') 7 @('go'))
+        if (($updates -join ',') -ne 'go' -or $holds.go) { throw 'forced update did not reach Scoop or release the hold' }
+        'ok: forced dry-run does not update; forced run reaches the Scoop update boundary for Go'
+    } finally {
+        $resolved = [System.IO.Path]::GetFullPath($testRoot)
+        $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'unsafe fixture cleanup path' }
+        if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }
+    }
+}

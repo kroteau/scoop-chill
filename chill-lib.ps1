@@ -339,6 +339,7 @@ function Set-ChillState([string]$name, [hashtable]$entry, [string]$dir) {
     Write-ChillJson @{
         Version       = $entry.Version
         VersionHash   = $entry['VersionHash']
+        Repushed      = [bool]$entry['Repushed']
         FirstSeen     = ConvertFrom-ChillDate $entry.FirstSeen
         UpdatedAt     = ConvertFrom-ChillDate $entry.UpdatedAt
         ScriptHeld    = $entry.ScriptHeld
@@ -398,6 +399,7 @@ function Resolve-ChillEntry([string]$name, [string]$latest, [nullable[datetime]]
         $entry = @{
             Version       = $stored.Version
             VersionHash   = $stored['VersionHash']
+            Repushed      = [bool]$stored['Repushed']
             FirstSeen     = ConvertTo-ChillDate $stored.FirstSeen
             UpdatedAt     = ConvertTo-ChillDate $stored.UpdatedAt
             ScriptHeld    = [bool]$stored['ScriptHeld']
@@ -407,13 +409,7 @@ function Resolve-ChillEntry([string]$name, [string]$latest, [nullable[datetime]]
             PinnedDate    = ConvertTo-ChillDate $stored['PinnedDate']
         }
         if ($manifestDate -and $entry.UpdatedAt -and $manifestDate -ne $entry.UpdatedAt) {
-            $newCommit = Find-ChillVersionCommit $latest $file
-            $oldHash   = $entry['VersionHash']
-            $hashNote  = if ($oldHash -and $newCommit.Hash -and $oldHash -ne $newCommit.Hash) {
-                " (hash $($oldHash.Substring(0,7)) -> $($newCommit.Hash.Substring(0,7)))"
-            } else { '' }
-            Write-Warning "${name}: manifest re-pushed for $latest (was $($entry.UpdatedAt.ToString('yyyy-MM-dd HH:mm')), now $($manifestDate.ToString('yyyy-MM-dd HH:mm')))$hashNote"
-            if ($newCommit.Hash) { $entry['VersionHash'] = $newCommit.Hash }
+            $entry.Repushed = $true
         }
         $entry.UpdatedAt = $manifestDate
     } else {
@@ -421,6 +417,7 @@ function Resolve-ChillEntry([string]$name, [string]$latest, [nullable[datetime]]
         $entry  = @{
             Version       = $latest
             VersionHash   = $commit.Hash
+            Repushed      = $false
             FirstSeen     = if ($commit.Date) { $commit.Date } else { $now }
             UpdatedAt     = $manifestDate
             ScriptHeld    = if ($stored) { [bool]$stored['ScriptHeld'] } else { $false }
@@ -433,7 +430,7 @@ function Resolve-ChillEntry([string]$name, [string]$latest, [nullable[datetime]]
             $entry['PinnedVersion'] = $stored['PinnedVersion']
             $entry['PinnedHash']    = $stored['PinnedHash']
             $entry['PinnedDate']    = ConvertTo-ChillDate $stored['PinnedDate']
-        } elseif ($stored -and $stored['ScriptHeld'] -and $stored['Version']) {
+        } elseif ($stored -and $stored['ScriptHeld'] -and $stored['Version'] -and -not $stored['Repushed']) {
             # Latest moved past a version we were holding: pin to that version so
             # the upgrade path goes through it first.
             $pinCommit = Find-ChillVersionCommit $stored['Version'] $file
@@ -441,6 +438,20 @@ function Resolve-ChillEntry([string]$name, [string]$latest, [nullable[datetime]]
             $entry['PinnedHash']    = $pinCommit.Hash
             $entry['PinnedDate']    = $pinCommit.Date
         }
+    }
+    # History catches re-pushes predating state or observed by older releases.
+    if ($manifestDate -and -not $entry['Repushed']) {
+        # With VersionHash, FirstSeen is the introduction date; reuse it to avoid a history walk.
+        $introDate = $entry.FirstSeen
+        if (-not $entry['VersionHash'] -or -not $introDate) {
+            $intro = Find-ChillVersionCommit $latest $file
+            $introDate = $intro.Date
+            if ($intro.Hash -and $intro.Date) {
+                $entry.VersionHash = $intro.Hash
+                $entry.FirstSeen = $intro.Date
+            }
+        }
+        if ($introDate -and $manifestDate -ne $introDate) { $entry.Repushed = $true }
     }
     if (-not $entry.FirstSeen) { $entry.FirstSeen = $now }
     return $entry
@@ -458,9 +469,11 @@ function Get-ChillDecision([hashtable]$entry, [hashtable]$status, [datetime]$cut
         Write-Warning "$($status.name): pinned $($entry['PinnedVersion']) has no resolvable date; gating on first-seen"
         $gate = $entry.FirstSeen
     }
-    $ready = $forced -or ($gate -and $gate -lt $cutoff)
+    $repushed = $entry['Repushed'] -and (!$entry['PinnedVersion'] -or $entry['PinnedVersion'] -eq $entry.Version)
+    $ready = $forced -or (!$repushed -and $gate -and $gate -lt $cutoff)
 
-    $action = if ($manualHold -and -not $forced) { 'ManualHold' }
+    $action = if ($repushed -and -not $forced) { 'Repushed' }
+              elseif ($manualHold -and -not $forced) { 'ManualHold' }
               elseif ($ready)                    { if ($forced) { 'Forced' } else { 'Ready' } }
               else                               { 'Held' }
 

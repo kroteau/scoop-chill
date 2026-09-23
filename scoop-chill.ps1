@@ -22,7 +22,7 @@
 #     scoop chill reset extras         and in just one
 #
 # Options:
-#   -f, --force            Update named apps regardless of age or hold
+#   -f, --force, -Force    Update named apps regardless of age, hold, or re-push
 #   -d, --dry-run          Report every write this would make, make none of them
 #   -n, --no-refresh       Skip the bucket refresh regardless of its age
 #   -a, --min-age <days>   Days a version must be available before installing
@@ -76,6 +76,7 @@ $updateAst.FindAll({ param($node) $node -is [System.Management.Automation.Langua
 $subCommands = @('status', 'pin', 'unpin', 'versions', 'proxy', 'reset')
 $subCommand = if ($args.Count -gt 0 -and $args[0] -in $subCommands) { $args[0] } else { $null }
 $rest = if ($subCommand) { @($args | Select-Object -Skip 1) } else { @($args) }
+$rest = @($rest | ForEach-Object { if ($_ -ieq '-force') { '--force' } else { $_ } })
 
 $opt, $apps, $err = getopt $rest 'fdna:c:ksq' 'force', 'dry-run', 'no-refresh', 'min-age=', 'count=', 'no-cache', 'skip-hash-check', 'quiet'
 if ($err) { "scoop chill: $err"; exit 1 }
@@ -186,6 +187,7 @@ function Get-ChillReport([string[]]$named, [int]$minAgeDays, [string[]]$forced) 
 }
 
 function Show-ChillReport([object[]]$rows) {
+    $rows = @($rows | Where-Object Action -NE 'Repushed')
     $rows | Format-Table -AutoSize -Property Name, Installed, Latest, 'First Seen', Age, Proxy, Pin, Action
     $ready  = @($rows | Where-Object { $_.Action -in 'Ready', 'Forced' })
     $proxied = @($ready | Where-Object Proxy -EQ '*').Count

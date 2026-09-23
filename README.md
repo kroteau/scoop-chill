@@ -74,6 +74,12 @@ you created yourself are displayed as `ManualHold` and are never changed.
 a newer manifest, chill pins the held version first, so releases are not
 silently skipped.
 
+Re-pushed versions (manifest changes without a version change) are hidden from
+the normal report and blocked from updates, even after the age gate expires.
+Chill remembers this block across runs; a newer version is evaluated normally.
+Use `scoop chill go -Force` (also `-f` or `--force`) to allow a re-pushed update.
+An explicit pin to a different version still follows its own age gate.
+
 ## Configuration and state
 
 | Key | Default | Meaning |
@@ -100,7 +106,41 @@ Run the test suite with:
 .\chill.tests.ps1
 ```
 
-For a release, create and push a `v<version>` tag, then update `version`,
-`url`, `hash`, and `extract_dir` in
-[`bucket/scoop-chill.json`](bucket/scoop-chill.json). The manifest includes
-`checkver` and `autoupdate` metadata for GitHub tags.
+The re-push integration test creates a temporary Git bucket and state directory.
+It checks the normal report/update flow with no prior package state, a repeated
+run, and forced updates. Scoop installation and update calls are mocked, so it
+does not modify installed packages.
+
+For a release, commit your changes, then run:
+
+```powershell
+.\release.ps1 0.0.7
+```
+
+Add `-WhatIf` to preview the remaining steps. It reads local state and queries
+remote tags, but does not fetch, run tests, download archives, or change files.
+Checks requiring a missing local tag or an archive download are deferred.
+
+The script discovers and runs root-level `chill*.tests.ps1` files in name order,
+creates and pushes the tag, and updates the manifest using that exact version.
+It verifies the manifest against the downloaded archive, commits only the manifest,
+and pushes the current branch to the same branch name on the configured remote.
+Unrelated staged and unstaged files are left alone; existing commits on that branch
+are included in the push. Use `-WhatIf` to preview before publishing.
+
+Rerun the same command to resume: existing tags are reused, conflicting tags are
+rejected, and an already correct manifest is left alone. New tags require a clean
+working tree. When resuming, README, release script, and manifest edits are allowed;
+the remaining tracked files must match the tag. Published tags are never moved.
+If the branch push fails, rerunning retries it without duplicating the manifest
+commit. Diverged branches require reconciliation; the script never force-pushes.
+
+Use your next release version in place of `0.0.7`. `checkver` reads published
+GitHub tags; no GitHub release is required. Local-only tags are not visible to
+it, and their archives cannot be downloaded to calculate the hash.
+
+The command updates `version`, `url`, `hash`, and `extract_dir` together.
+The release tag stays on the tested commit, before the manifest commit.
+When using `checkver` directly, commit and push the manifest yourself.
+To target a particular published tag, add `-Version 0.0.7`
+(without the `v`) to the `checkver` command.
