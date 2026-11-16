@@ -1,9 +1,9 @@
 # scoop-chill
 
-`scoop chill` delays application updates until the corresponding bucket
-manifest has been available for a configurable number of days. It is intended
-to reduce exposure to freshly published, broken releases without giving up
-Scoop's normal update workflow.
+`scoop chill` delays an app's update until chill has known about the new
+version for a set number of days (7 by default). It is intended to reduce
+exposure to freshly published, broken releases without giving up Scoop's
+normal update workflow.
 
 It is a Scoop command, not a replacement for `scoop update`: use `scoop chill`
 when you want the age gate, and `scoop update` when you explicitly want Scoop's
@@ -64,11 +64,11 @@ directories. Review its output, or use `-d` first, before running it.
 ## How the gate works
 
 `<app>@<version>` selects the newest manifest from that version's most recent
-run in the installed bucket's Git history, gated on when chill first saw it. No
-manifest is generated. The target's age gate and manual holds still apply unless
-`-f` is used; upgrades and downgrades are supported. An already-installed target
-is a no-op, including with `-f`. Unknown versions and URL-installed apps are
-skipped with a warning.
+run in the installed bucket's Git history, gated on when chill first saw it.
+The target's age gate and manual holds still apply unless `-f` is used;
+upgrades and downgrades are supported. An already-installed target is a no-op,
+including with `-f`. Unknown versions and URL-installed apps are skipped with a
+warning.
 
 This target applies only to the current invocation; later ordinary updates
 resume the normal age gate. The bucket manifest is restored after the update; a
@@ -85,10 +85,9 @@ A version's age is counted from the run that first saw it, never from a Git
 date: a commit's author sets those, and can backdate them. Every run records
 the versions it sees for the first time, `status` and `scoop chill` alone
 included; `-d` shows such a version at age 0 and records nothing. A version
-chill has never seen counts as seen now,
-including on first use, after adding a bucket, and after upgrading from a
-release without this record: everything outstanding then waits the age gate
-once.
+chill has never seen counts as seen now, including on first use, after adding
+a bucket, and after upgrading from a release without this record: everything
+outstanding then waits the age gate once.
 
 The report reads left to right:
 
@@ -101,8 +100,7 @@ The report reads left to right:
 
 `Target` is the step, an `app@version` target, or latest under `-f`. It carries
 `(-N)` for the versions still newer than it; `(?)` means history does not know
-it. `Action` carries `^` for an app routed through the proxy. The marks are display only: the row's `TargetVersion`,
-`Behind`, `TargetSource` and `Proxy` properties hold the same facts unadorned.
+it. `Action` carries `^` for an app routed through the proxy.
 
 Until a version has aged, chill places a Scoop hold and records that it owns the
 hold. An app left short of latest, by a step or by an update that did not land,
@@ -119,11 +117,11 @@ forget a version that is due.
 
 A version is gated on when chill first saw it, and installs from its
 newest manifest. Any later change to that manifest without a version change is
-warned about. When the change touches what gets installed or run (`url`,
-`hash`, `extract_dir`, `extract_to`, `innosetup`, `depends`, `bin`,
-`shortcuts`, `persist`, `psmodule`, `env_add_path`, `env_set`, `installer`,
-`uninstaller`, or a `pre_`/`post_` install or uninstall script, at the top
-level or for an architecture), updates skip that version, and keep warning with
+warned about. Some changes touch what gets installed or run: `url`, `hash`,
+`extract_dir`, `extract_to`, `innosetup`, `depends`, `bin`, `shortcuts`,
+`persist`, `psmodule`, `env_add_path`, `env_set`, `installer`, `uninstaller`,
+or a `pre_`/`post_` install or uninstall script, at the top level or for an
+architecture. Updates skip a version with such a change, and keep warning with
 the fields that changed, until a newer version passes the age gate; naming the
 app does not change that. Naming the version, as in
 `scoop chill llmfit@1.1.18`, takes the changed manifest. Every run warns about
@@ -164,9 +162,9 @@ scoop config chill_min_age_days 14
 Chill keeps its own state in `~\scoop\persist\scoop-chill`, including the last
 refresh, holds it created, proxy choices, and when it first saw each version.
 Deleting an app's state file makes every version it may install wait the age
-gate again. The proxy address uses
-Scoop's `[user:pass@]host:port` form. Because this state is stored locally,
-avoid putting long-lived credentials in the proxy URL when possible.
+gate again. The proxy address uses Scoop's `[user:pass@]host:port` form. The
+address, password included, is stored in plain text in `_scoop_chill.json`,
+so prefer a proxy account without other uses.
 
 ## Development
 
@@ -204,12 +202,12 @@ Add `-WhatIf` to preview the remaining steps. It reads local state and queries
 remote tags, but does not fetch, run tests, download archives, or change files.
 Checks requiring a missing local tag or an archive download are deferred.
 
-The script discovers and runs root-level `chill*.tests.ps1` files in name order,
-creates and pushes the tag, and updates the manifest using that exact version.
-It verifies the manifest against the downloaded archive, commits only the manifest,
-and pushes the current branch to the same branch name on the configured remote.
-Unrelated staged and unstaged files are left alone; existing commits on that branch
-are included in the push. Use `-WhatIf` to preview before publishing.
+The script discovers and runs root-level `chill*.tests.ps1` files in name
+order, creates and pushes the tag, and updates the manifest using that exact
+version. It verifies the manifest against the downloaded archive, commits only
+the manifest, and pushes the current branch to the same branch name on the
+configured remote. Unrelated staged and unstaged files are left alone;
+existing commits on that branch are included in the push.
 
 Rerun the same command to resume: existing tags are reused, conflicting tags are
 rejected, and an already correct manifest is left alone. New tags require a clean
