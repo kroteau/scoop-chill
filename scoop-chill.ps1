@@ -3,17 +3,15 @@
 # Summary: Update apps only once their manifest has aged
 # Help: 'scoop chill' updates apps like 'scoop update', except an app is held
 # back until its manifest has sat in the bucket for a while, so you are not the
-# one who finds out a release is broken. Held apps are held with scoop's own
-# hold, and released automatically once they age past the gate.
+# one who finds out a release is broken. An outdated app moves to the newest
+# version in bucket history that has aged, which may be short of latest. Held
+# apps are held with scoop's own hold, and released once a version ages.
 #
-#     scoop chill                      show the table, change nothing
+#     scoop chill                      show the table, record new versions
 #     scoop chill *                    update everything past the age gate
 #     scoop chill firefox -f           ignore the gate for one app
 #     scoop chill firefox@141.0        update using that version's Git manifest
-#     scoop chill status [firefox]     show the table, change nothing
-#     scoop chill pin firefox 141.0    install that version when it has aged
-#     scoop chill pin firefox          pin the next version after the installed one
-#     scoop chill unpin firefox
+#     scoop chill status [firefox]     show the table, record new versions
 #     scoop chill versions firefox     versions known to bucket history
 #     scoop chill proxy                show proxy settings
 #     scoop chill proxy set <host:port>  store the proxy ('none' clears it)
@@ -23,7 +21,7 @@
 #     scoop chill reset extras         and in just one
 #
 # Options:
-#   -f, --force, -Force    Update named apps regardless of age, hold, or re-push
+#   -f, --force, -Force    Update named apps to latest regardless of age or hold
 #   -d, --dry-run          Report every write this would make, make none of them
 #   -n, --no-refresh       Skip the bucket refresh regardless of its age
 #   -a, --min-age <days>   Days a version must be available before installing
@@ -74,7 +72,7 @@ $updateAst.FindAll({ param($node) $node -is [System.Management.Automation.Langua
     Where-Object Name -EQ 'update' |
     ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
 
-$subCommands = @('status', 'pin', 'unpin', 'versions', 'proxy', 'reset')
+$subCommands = @('status', 'versions', 'proxy', 'reset')
 $subCommand = if ($args.Count -gt 0 -and $args[0] -in $subCommands) { $args[0] } else { $null }
 $rest = if ($subCommand) { @($args | Select-Object -Skip 1) } else { @($args) }
 $rest = @($rest | ForEach-Object { if ($_ -ieq '-force') { '--force' } else { $_ } })
@@ -88,7 +86,8 @@ $quiet     = $opt.q -or $opt.quiet
 $minAge    = if ($opt.a) { $opt.a } elseif ($opt.'min-age') { $opt.'min-age' } else { get_config CHILL_MIN_AGE_DAYS 7 }
 $count     = if ($opt.c) { $opt.c } elseif ($opt.count) { $opt.count } else { 5 }
 $apps      = @($apps)
-if ($apps.Count -eq 1 -and $apps[0] -eq '*') { $apps = @(installed_apps $false) }
+$isEveryApp = $apps.Count -eq 1 -and $apps[0] -eq '*'
+if ($isEveryApp) { $apps = @(installed_apps $false) }
 
 if (!(Test-GitAvailable)) {
     error 'git is required to read bucket history. Run: scoop install git'
@@ -125,8 +124,11 @@ function Confirm-ChillWrite([string]$intent) {
     return !$dryRun
 }
 
-# One row per app worth deciding about: outdated, or pinned and therefore due to
-# move even when scoop considers it current. Pure: it reads state, never writes.
+# One row per app worth deciding about: outdated, forced, or given a version.
+# Pure: it reads state, never writes.
+# An outdated app steps to the newest version in bucket history past the age
+# gate, never straight to latest. Every version installs from its newest
+# manifest.
 function Get-ChillReport([string[]]$named, [int]$minAgeDays, [string[]]$forced) {
     $cutoff = $now.AddDays(-$minAgeDays)
     $names  = if ($named) { $named } else { @(installed_apps $false) }
@@ -146,25 +148,28 @@ function Get-ChillReport([string[]]$named, [int]$minAgeDays, [string[]]$forced) 
         # never update it: it needs 'scoop install', not another update pass.
         if ($status.failed) {
             $rows.Add([pscustomobject]@{
-                Name         = $name
-                Installed    = ''
-                Latest       = ''
-                'First Seen' = ''
-                Age          = 0
-                Proxy        = ''
-                Pin          = ''
-                Action       = 'Failed'
-                Entry        = $null
-                Decision     = $null
+                Name          = $name
+                Installed     = ''
+                Latest        = ''
+                Published     = ''
+                TargetVersion = $null
+                TargetSource  = $null
+                Behind        = $null
+                Indexed       = ''
+                Age           = $null
+                Proxy         = ''
+                IsHeld        = $false
+                Action        = 'Failed'
+                Entry         = $null
+                Decision      = $null
             })
             continue
         }
         if (!$status.installed) { warn "'$name' isn't installed."; continue }
-        $stored = Get-ChillState $name $stateDir
-        $isPinned = $stored -and $stored['PinnedVersion']
-        if (!$status.outdated -and !$isPinned -and !$isForced -and !$target.Version) { continue }
+        if (!$status.outdated -and !$isForced -and !$target.Version) { continue }
+        $entry = ConvertTo-ChillEntry (Get-ChillState $name $stateDir)
 
-        $file      = Find-ChillManifest $name
+        $file     = Find-ChillManifest $name
         $latest    = if ($status.latest_version) { $status.latest_version } else { $status.version }
         $requested = $null
         if ($target.Version) {
@@ -172,20 +177,46 @@ function Get-ChillReport([string[]]$named, [int]$minAgeDays, [string[]]$forced) 
                 Write-Warning "${name}: version targets require a bucket-installed app; skipping URL install"
                 continue
             }
-            $requested = Find-ChillVersionCommit $target.Version $file
-            if (!$requested.Hash -or !$requested.Date) {
+            $requested = Find-ChillVersionRun $target.Version $file
+            if (!$requested.Newest.Hash -or !$requested.Original.Date) {
                 Write-Warning "${name}: version $($target.Version) not found with a date in bucket history; skipping"
                 continue
             }
         }
-        $entry = Resolve-ChillEntry $name $latest (Get-ChillManifestDate $file) $file $stored $now ([bool]$target.Version)
-        $decisionEntry = $entry
-        if ($target.Version) {
-            # The target is transient; persist latest's history and the user's pin unchanged.
-            $decisionEntry = $entry.Clone()
-            $decisionEntry.PinnedVersion = $target.Version
-            $decisionEntry.PinnedDate = $requested.Date
-            $decisionEntry.Repushed = $false
+        $latestRun = Find-ChillVersionRun $latest $file
+        # Each version this row might install ages from when chill first saw
+        # it. A version seen for the first time counts as seen now; the run
+        # records it.
+        $versions  = @(Get-ChillNewerVersions $file $status.version)
+        $firstSeen = Get-ChillFirstSeen $entry.Seen (@($versions | ForEach-Object { $_.Version }) + $requested.Version + $latestRun.Version) $now
+        foreach ($run in @($versions) + $requested + $latestRun) {
+            if ($run) { $run.Seen = $firstSeen.Dates[$run.Version] }
+        }
+        # Forcing goes straight to latest, so it needs no step. A version whose
+        # install fields changed after its release is never a step, and is
+        # warned about until a newer version passes the gate.
+        $step = $null
+        if (!$target.Version -and !$isForced) {
+            foreach ($run in $versions) { $run.Rewrite = Find-ChillInstallRewrite $file $run }
+            $step = Select-ChillUpdateTarget @($versions | Where-Object { !$_.Rewrite }) $cutoff
+            $isStepAged = $step -and $step.Seen -lt $cutoff
+            # Newest first: rewrites above an aged step are skipped ones, and
+            # anything below it is already passed.
+            foreach ($run in $versions) {
+                if ($run.Rewrite) {
+                    Write-Warning ("${name}: $($run.Version)'s {2} changed on {0:yyyy-MM-dd}, after its release on {1:yyyy-MM-dd}. Skipped until a newer version passes the age gate; to take it, run: scoop chill $name@$($run.Version)" -f $run.Rewrite.Date, $run.Original.Date, ($run.Rewrite.Fields -join ', '))
+                }
+                if ($isStepAged -and $run.Version -eq $step.Version) { break }
+            }
+        }
+        $chosen = if ($requested) { $requested } elseif ($isForced) { $latestRun } else { $step }
+        if ($chosen -and !$step) { $chosen.Rewrite = Find-ChillInstallRewrite $file $chosen }
+
+        $decisionEntry = $entry.Clone()
+        if ($requested) {
+            $decisionEntry.TargetDate = $requested.Seen
+        } elseif ($step) {
+            $decisionEntry.TargetDate = $step.Seen
         }
         $decision = Get-ChillDecision $decisionEntry (@{ name = $name } + $status) $cutoff $isForced
         if ($target.Version -and $status.version -eq $target.Version) {
@@ -193,21 +224,55 @@ function Get-ChillReport([string[]]$named, [int]$minAgeDays, [string[]]$forced) 
             $decision.Ready = $false
         }
 
-        $age = if ($decision.Gate) { [int][math]::Floor(($now - $decision.Gate).TotalDays) } else { 0 }
+        # Say which manifest this run takes, and why, when that is not simply
+        # the aged release: what -f bypasses, and what changed since release.
+        if ($chosen -and $decision.Action -ne 'Current') {
+            if ($isForced) { Write-Warning "${name}: -f installs $($chosen.Version), ignoring the age gate and holds." }
+            if ($chosen.Rewrite) {
+                Write-Warning ("${name}: $($chosen.Version)'s {2} changed on {0:yyyy-MM-dd}, after its release on {1:yyyy-MM-dd}; installing the changed manifest." -f $chosen.Rewrite.Date, $chosen.Original.Date, ($chosen.Rewrite.Fields -join ', '))
+            } elseif ($chosen.Commits.Count -gt 1) {
+                # Not skipped, since what is installed is the same, but any
+                # edit after a release is worth a look before it lands.
+                Write-Warning ("${name}: $($chosen.Version)'s manifest was edited on {0:yyyy-MM-dd}, after its release on {1:yyyy-MM-dd}; nothing it installs or runs changed." -f $chosen.Newest.Date, $chosen.Original.Date)
+            }
+        }
+
+        # Every version installs from its newest manifest: a later commit that
+        # kept the install fields only fixes it, and one that changed them is
+        # taken only when asked for.
+        $commit = if ($requested) { $requested.Newest } elseif ($step) { $step.Newest } else { $null }
+        # A step that is the bucket's HEAD needs no historical manifest.
+        $isHead = $commit -and !$requested -and $commit.Hash -eq (Get-ChillLog $file).Hashes[0]
+        $targetHash = if ($commit -and !$isHead) { $commit.Hash } else { $null }
+
+        # The version this row would install, which Indexed and Age describe.
+        $latestDate = $latestRun.Original.Date
+        $targetSource, $targetVersion, $indexedDate =
+            if ($requested)    { 'Requested', $target.Version, $decision.Gate }
+            elseif ($isForced) { 'Latest', $latest, $latestRun.Seen }
+            elseif ($step)     { 'Step', $step.Version, $decision.Gate }
+            else               { $null, $null, $null }
+        $behind = if ($targetVersion) { Measure-ChillVersionsBehind $file $targetVersion } else { $null }
+
         $rows.Add([pscustomobject]@{
             Name          = $name
             Installed     = $status.version
             Latest        = $latest
-            TargetVersion = $target.Version
-            TargetHash    = if ($requested) { $requested.Hash } else { $null }
-            TargetFile    = if ($requested) { $file } else { $null }
-            'First Seen'  = if ($requested) { $requested.Date.ToString('yyyy-MM-dd') } else { $entry.FirstSeen.ToString('yyyy-MM-dd') }
-            Age           = $age
+            Published     = if ($latestDate) { $latestDate.ToString('yyyy-MM-dd') } else { '' }
+            TargetVersion = $targetVersion
+            TargetSource  = $targetSource
+            Behind        = $behind
+            TargetHash    = $targetHash
+            TargetFile    = if ($targetHash) { $file } else { $null }
+            Indexed       = if ($indexedDate) { $indexedDate.ToString('yyyy-MM-dd') } else { '' }
+            Age           = if ($indexedDate) { [int][math]::Floor(($now - $indexedDate).TotalDays) } else { $null }
             Proxy         = if ($entry['Proxy']) { '*' } else { '' }
-            Pin           = if ($entry['PinnedVersion']) { $entry['PinnedVersion'] } else { '' }
+            IsHeld        = [bool]$status.hold
             Action        = $decision.Action
             Entry         = $entry
             Decision      = $decision
+            Seen          = $firstSeen.Dates
+            NewlySeen     = $firstSeen.Unrecorded
         })
     }
 
@@ -216,31 +281,51 @@ function Get-ChillReport([string[]]$named, [int]$minAgeDays, [string[]]$forced) 
     return @($rows | Sort-Object { @('Failed', 'Current', 'Held', 'ManualHold', 'Ready', 'Forced').IndexOf($_.Action) }, Age)
 }
 
+# Target carries '(-N)' for the versions still newer than it, '(?)' when history
+# does not know it. Action carries '^' for an app routed through the proxy.
 function Show-ChillReport([object[]]$rows) {
-    $rows = @($rows | Where-Object Action -NE 'Repushed')
-    $rows | Format-Table -AutoSize -Property Name, Installed, Latest, @{ Label = 'Target'; Expression = { $_.TargetVersion } }, 'First Seen', Age, Proxy, Pin, Action
+    $targetCell = {
+        if (!$_.TargetVersion) { return '' }
+        $distance = if ($null -eq $_.Behind) { ' (?)' } elseif ($_.Behind -gt 0) { " (-$($_.Behind))" } else { '' }
+        "$($_.TargetVersion)$distance"
+    }
+    $actionCell = { if ($_.Proxy -eq '*') { "$($_.Action)^" } else { $_.Action } }
+    $rows | Format-Table -AutoSize -Property Name, Installed, Latest, Published, @{ Label = 'Target'; Expression = $targetCell }, Indexed, Age, @{ Label = 'Action'; Expression = $actionCell }
     $ready  = @($rows | Where-Object { $_.Action -in 'Ready', 'Forced' })
     $proxied = @($ready | Where-Object Proxy -EQ '*').Count
-    $pinned  = @($ready | Where-Object { !$_.TargetVersion -and $_.Pin -ne '' }).Count
     $held    = @($rows | Where-Object Action -EQ 'Held').Count
     $manual  = @($rows | Where-Object Action -EQ 'ManualHold').Count
     $failed  = @($rows | Where-Object Action -EQ 'Failed')
-    Write-Host "$($ready.Count) ready ($proxied proxy), $held held, $manual manual, $pinned pinned." -ForegroundColor Cyan
+    Write-Host "$($ready.Count) ready ($proxied proxy), $held held, $manual manual." -ForegroundColor Cyan
     if ($failed) {
         error "Install left unfinished: $($failed.Name -join ', '). Repair with: scoop install $($failed.Name -join ' ')"
     }
 }
 
+# Record the versions the report saw for the first time: they age from now.
+# A report records them too, or a version only ever looked at would show age 0
+# every day and never pass the gate.
+function Save-ChillFirstSeen([object[]]$rows) {
+    foreach ($row in $rows) {
+        if ($row.Action -in 'Failed', 'Current' -or !$row.NewlySeen) { continue }
+        if (Confirm-ChillWrite "record $($row.Name) $($row.NewlySeen -join ', ') as first seen now") {
+            Update-ChillState $row.Name $stateDir @{ Seen = $row.Seen } | Out-Null
+        }
+    }
+}
+
 function Invoke-ChillRun([object[]]$rows) {
+    # Before an update can end the run, whatever else happens to the app.
+    Save-ChillFirstSeen $rows
+
+    # Hold what is not ready. A ready app keeps its hold until its own update
+    # starts, so one this run never reaches is still held afterwards. The state
+    # alone is not trusted: a hold recorded as chill's but lost to 'scoop
+    # unhold' or a reinstall is placed again.
     foreach ($row in $rows) {
         if ($row.Action -in 'Failed', 'Current') { continue }
-        $entry = $row.Entry
-        if ($row.Decision.Ready -and $entry.ScriptHeld) {
-            if ((Confirm-ChillWrite "unhold $($row.Name)") -and (Set-ChillHold $row.Name $false)) { $entry.ScriptHeld = $false }
-        } elseif (!$row.Decision.Ready -and !$row.Decision.ManualHold -and !$entry.ScriptHeld) {
-            if ((Confirm-ChillWrite "hold $($row.Name)") -and (Set-ChillHold $row.Name $true)) { $entry.ScriptHeld = $true }
-        }
-        if (Confirm-ChillWrite "record state for $($row.Name)") { Set-ChillState $row.Name $entry $stateDir }
+        if ($row.Decision.Ready -or $row.Decision.ManualHold -or $row.IsHeld) { continue }
+        if (Confirm-ChillWrite "hold $($row.Name)") { Set-ChillOwnedHold $row.Name $true $stateDir }
     }
 
     # Update Chill itself last because Scoop may abort this script on failure.
@@ -269,12 +354,12 @@ function Invoke-ChillRun([object[]]$rows) {
         $verb  = if ($row.Action -eq 'Forced') { 'force-update' } else { 'update' }
         $label = if ($row.Action -eq 'Forced') { 'Force-updating' } else { 'Updating' }
         $notes = @()
-        if ($row.TargetVersion) { $notes += "version $($row.TargetVersion)" }
-        elseif ($row.Pin -ne '') { $notes += "pinned $($row.Pin)" }
+        if ($row.TargetSource -in 'Requested', 'Step') { $notes += "version $($row.TargetVersion)" }
         if ($row.Proxy -eq '*') { $notes += 'proxy' }
         $tag = if ($notes) { " ($($notes -join ', '))" } else { '' }
         if (!(Confirm-ChillWrite "$verb $($row.Name)$tag")) { continue }
         Write-Host "  $label$($tag): $($row.Name)" -ForegroundColor Yellow
+        if ($row.Entry.ScriptHeld) { Set-ChillOwnedHold $row.Name $false $stateDir }
 
         # Proxy is now just an attribute of the app, applied around its own
         # update, so proxied apps no longer need a pass of their own.
@@ -285,9 +370,19 @@ function Invoke-ChillRun([object[]]$rows) {
         $url = if ($row.Proxy -eq '*') { $proxyUrl } else { $null }
         $finished = $false
         try {
-            Invoke-ChillProxied $url { Invoke-ChillAppUpdate $row $stateDir $updateOptions }
+            Invoke-ChillProxied $url { Invoke-ChillAppUpdate $row $updateOptions }
             $finished = $true
         } finally {
+            # Hold again whatever is still short of latest: a step on the way
+            # there, or an update that did not land. A fresh install.json
+            # carries no hold, so a step would otherwise be left open to a
+            # plain 'scoop update'. A manual hold that -f overrode is put back
+            # whatever happened, and stays the user's: -f was for this run only.
+            if ($row.Decision.ManualHold) {
+                Set-ChillHold $row.Name $true | Out-Null
+            } elseif ((Select-CurrentVersion -AppName $row.Name) -ne $row.Latest) {
+                Set-ChillOwnedHold $row.Name $true $stateDir
+            }
             # scoop reports a failed download or hash with abort, which is
             # 'exit 1': not catchable, and it ends this script, so every app left
             # in the pass is skipped without explanation. A finally still runs,
@@ -305,8 +400,6 @@ function Show-ChillVersions([string]$name, [int]$wanted) {
     $log = Get-ChillLog $file
     if (!$log -or $log.Hashes.Count -eq 0) { error "No git history found for '$name'."; return }
 
-    $state     = Get-ChillState $name $stateDir
-    $pinned    = if ($state) { $state['PinnedVersion'] } else { $null }
     $installed = Select-CurrentVersion -AppName $name
     $seen      = [System.Collections.Generic.HashSet[string]]::new()
     $rows      = [System.Collections.Generic.List[object]]::new()
@@ -323,25 +416,11 @@ function Show-ChillVersions([string]$name, [int]$wanted) {
                 Date      = if ($date) { $date.ToString('yyyy-MM-dd') } else { '' }
                 Hash      = $hash.Substring(0, 7)
                 Installed = if ($ver -eq $installed) { '*' } else { '' }
-                Pinned    = if ($ver -eq $pinned) { '*' } else { '' }
             })
             if ($rows.Count -ge $wanted) { break }
         }
     }
     $rows | Format-Table -AutoSize
-}
-
-function Show-ChillPin([string]$name) {
-    $state = Get-ChillState $name $stateDir
-    if (!$state -or !$state['PinnedVersion']) { return }
-    $date = ConvertTo-ChillDate $state['PinnedDate']
-    [pscustomobject]@{
-        Name      = $name
-        Installed = Select-CurrentVersion -AppName $name
-        Pin       = $state['PinnedVersion']
-        Pinned    = if ($date) { $date.ToString('yyyy-MM-dd') } else { '' }
-        Age       = if ($date) { [int][math]::Floor(($now - $date).TotalDays) } else { $null }
-    }
 }
 
 function Invoke-ChillProxyCommand([string[]]$arguments) {
@@ -378,28 +457,9 @@ function Invoke-ChillProxyCommand([string[]]$arguments) {
 
 switch ($subCommand) {
     'status' {
-        Show-ChillReport (Get-ChillReport $apps $minAge @())
-    }
-    'pin' {
-        if (!$apps) { error 'Usage: scoop chill pin <app> [<version>]'; exit 1 }
-        $name = $apps[0]
-        if (!(Test-ChillApp $name)) { exit 1 }
-        # A bare pin steps one release forward from what is installed.
-        $version = if ($apps.Count -gt 1) { $apps[1] } else { Resolve-ChillNextPin $name }
-        if (!$version) { exit 1 }
-        if (Confirm-ChillWrite "pin $name to $version") {
-            Set-ChillPin $name $version $stateDir
-            # Report from state, not from intent: Set-ChillPin refuses a version
-            # it cannot find in history, and reporting the request would lie.
-            Show-ChillPin $name | Format-Table -AutoSize
-        }
-    }
-    'unpin' {
-        if (!$apps) { error 'Usage: scoop chill unpin <app>'; exit 1 }
-        foreach ($name in $apps) {
-            if (!(Test-ChillApp $name)) { continue }
-            if (Confirm-ChillWrite "unpin $name") { Clear-ChillPin $name $stateDir; success "'$name' unpinned." }
-        }
+        $rows = Get-ChillReport $apps $minAge @()
+        Show-ChillReport $rows
+        Save-ChillFirstSeen $rows
     }
     'versions' {
         if (!$apps) { error 'Usage: scoop chill versions <app>'; exit 1 }
@@ -428,7 +488,9 @@ switch ($subCommand) {
     default {
         if ($force -and !$apps) { error '--force needs an app name.'; exit 1 }
         if (!$apps) {
-            Show-ChillReport (Get-ChillReport @() $minAge @())
+            $rows = Get-ChillReport @() $minAge @()
+            Show-ChillReport $rows
+            Save-ChillFirstSeen $rows
             break
         }
 
@@ -441,10 +503,18 @@ switch ($subCommand) {
         # app arguments. Called rather than borrowed so its $PSScriptRoot, and
         # the parallel bucket fetch that depends on it, still resolve.
         if (!$noRefresh -and $stale -and (Confirm-ChillWrite 'refresh scoop and buckets')) {
+            $refreshStart = Get-Date
             & $updateScript
-            Set-ChillSetting 'LastRefresh' ($now.ToString('o')) $stateDir
             # The refresh may have moved manifests; drop the index built before it.
             Reset-ChillCache
+            # Record the refresh only if every bucket took it, so a failed one is
+            # retried next run rather than trusted as fresh for the next hour.
+            $unsynced = @(Get-ChillUnsyncedBucket $refreshStart)
+            foreach ($bucket in $unsynced) {
+                $hint = if ($bucket.IsDirty) { "; it has local changes, discard them with: scoop chill reset $($bucket.Bucket)" } else { '' }
+                warn "'$($bucket.Bucket)' did not refresh ($($bucket.Reason)), so its manifests may be out of date$hint"
+            }
+            if (!$unsynced) { Set-ChillSetting 'LastRefresh' ($now.ToString('o')) $stateDir }
         }
 
         $forcedApps = if ($force) { $apps } else { @() }

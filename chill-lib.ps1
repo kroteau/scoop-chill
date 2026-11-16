@@ -21,7 +21,7 @@ function Reset-ChillCache {
 # every hash to git's stdin before reading any stdout; past the pipe buffer both
 # sides block, no error, just a hang. Interleave reads before raising it that far.
 $script:ChillVersionChunkSize = 64
-$script:ChillLogPageSize      = 64
+$script:ChillLogFirstPageSize = 4
 
 #endregion
 
@@ -111,7 +111,7 @@ function ConvertFrom-ChillDate([object]$value) {
     return $value
 }
 
-# Read each commit's `version` field with one `git cat-file --batch`. Records are
+# Read each commit's top-level `version` with one `git cat-file --batch`. Records are
 # <oid> blob <size>\n<content>\n; parsed by byte offset so multi-byte UTF-8 in a
 # manifest cannot desync the record boundaries. Returns hash -> version.
 function Get-ChillVersionsAt([string]$root, [string]$relPath, [System.Collections.Generic.List[string]]$hashes) {
@@ -144,8 +144,7 @@ function Get-ChillVersionsAt([string]$root, [string]$relPath, [System.Collection
         $proc.Dispose()
     }
 
-    $rx = [regex]'"version"\s*:\s*"([^"]*)"'
-    $i  = 0
+    $i = 0
     # Skip the sacrificial query's response before mapping hashes to results.
     while ($i -lt $data.Length -and $data[$i] -ne 10) { $i++ }
     if ($i -lt $data.Length) { $i++ }
@@ -161,8 +160,16 @@ function Get-ChillVersionsAt([string]$root, [string]$relPath, [System.Collection
         $content = [System.Text.Encoding]::UTF8.GetString($data, $i, $size)
         $i += $size
         if ($i -lt $data.Length -and $data[$i] -eq 10) { $i++ }  # trailing LF
-        $m = $rx.Match($content)
-        $result[$h] = if ($m.Success) { $m.Groups[1].Value } else { $null }
+        # Parsed as Scoop parses it, which reads the top-level key: a pattern
+        # match takes the first "version" anywhere, so a nested one placed
+        # first passed a new version off as an aged one. A manifest Scoop could
+        # not parse has no version.
+        try {
+            $version = ($content.TrimStart([char]0xFEFF) | ConvertFrom-Json -ErrorAction Stop).version
+            $result[$h] = if ($version -is [string]) { $version } else { $null }
+        } catch {
+            $result[$h] = $null
+        }
     }
     return $result
 }
@@ -180,6 +187,7 @@ function Get-ChillLog([hashtable]$file) {
         Dates    = @{}
         Vers     = @{}
         Complete = $false
+        PageSize = 0
     }
     $script:ChillLogCache[$key] = $log
     Expand-ChillLog $log 1
@@ -189,9 +197,12 @@ function Get-ChillLog([hashtable]$file) {
 # Page commits in until $count are known or history runs out. A pathspec makes git
 # walk every commit to filter, so --max-count, which ends the walk as soon as it
 # has enough, is what keeps a near-HEAD query off the full history of a big bucket.
+# Asking for more commits than the file has walks that whole history anyway, so
+# pages start small and double: most lookups end a few commits below HEAD.
 function Expand-ChillLog([hashtable]$log, [int]$count) {
     while (-not $log.Complete -and $log.Hashes.Count -lt $count) {
-        $page  = [Math]::Max($count - $log.Hashes.Count, $script:ChillLogPageSize)
+        $log.PageSize = if ($log.PageSize) { 2 * $log.PageSize } else { $script:ChillLogFirstPageSize }
+        $page  = [Math]::Max($count - $log.Hashes.Count, $log.PageSize)
         $lines = @(git -C $log.File.BucketRoot log --format='%H %aI' --skip=$($log.Hashes.Count) --max-count=$page -- $log.File.RelPath 2>$null)
         foreach ($line in $lines) {
             $h, $d = $line -split ' ', 2
@@ -217,47 +228,128 @@ function Get-ChillVersionAt([hashtable]$file, [hashtable]$log, [int]$index) {
     return $log.Vers[$h]
 }
 
-# Earliest commit of the most recent run in which the manifest carried $Version.
-# Walks newest-first and stops once it passes that run's lower bound.
-function Find-ChillVersionCommit([string]$Version, [hashtable]$file) {
+# The most recent run of commits in which the manifest carried $Version, shaped
+# as Get-ChillNewerVersions returns them. Walks newest-first and stops once it
+# passes that run's lower bound.
+function Find-ChillVersionRun([string]$Version, [hashtable]$file) {
     if (-not $Version -or -not $file) { return $null }
     $log = Get-ChillLog $file
     if (-not $log) { return $null }
-    $intro = $null
+    $run = $null
     for ($i = 0; ; $i++) {
         Expand-ChillLog $log ($i + 1)
         if ($i -ge $log.Hashes.Count) { break }
         if ((Get-ChillVersionAt $file $log $i) -eq $Version) {
-            $h = $log.Hashes[$i]
-            $intro = @{ Hash = $h; Date = (ConvertTo-ChillDate $log.Dates[$h]) }
-        } elseif ($intro) {
+            $h      = $log.Hashes[$i]
+            $commit = @{ Hash = $h; Date = (ConvertTo-ChillDate $log.Dates[$h]) }
+            if (-not $run) { $run = @{ Version = $Version; Newest = $commit; Commits = [System.Collections.Generic.List[hashtable]]::new() } }
+            $run.Original = $commit
+            $run.Commits.Add($commit)
+        } elseif ($run) {
             break
         }
     }
-    return $intro
+    return $run
 }
 
-function Get-ChillManifestDate([hashtable]$file) {
-    if (-not $file) { return $null }
-    ConvertTo-ChillDate (git -C $file.BucketRoot log -1 --format='%aI' -- $file.RelPath 2>$null)
-}
-
-# The version one step newer than $installed in the manifest's history, or $null
-# when $installed is already the newest or is absent from the log. Commit order,
-# not version parsing: bucket versions are not all semver (llama.cpp ships b10214).
-function Find-ChillNextVersion([hashtable]$file, [string]$installed) {
+# Each version newer than $installed, newest first, from its most recent run of
+# commits: Original is the run's first commit and Newest its last, so a run of
+# more than one is a version rewritten after its release. Commit order, not
+# version parsing: bucket versions are not all semver (llama.cpp ships b10214).
+# With $installed absent from history nothing orders it, so only latest is
+# offered: any older entry could be a downgrade.
+function Get-ChillNewerVersions([hashtable]$file, [string]$installed) {
     $log = Get-ChillLog $file
-    if (-not $log) { return $null }
-    $newer = $null
-    $seen  = [System.Collections.Generic.HashSet[string]]::new()
+    if (-not $log) { return }
+    $versions = [System.Collections.Generic.List[hashtable]]::new()
+    $seen     = [System.Collections.Generic.HashSet[string]]::new()
+    $run      = $null
     for ($i = 0; ; $i++) {
         Expand-ChillLog $log ($i + 1)
-        if ($i -ge $log.Hashes.Count) { return $null }  # installed never found
-        $v = Get-ChillVersionAt $file $log $i
+        if ($i -ge $log.Hashes.Count) { return $versions | Select-Object -First 1 }
+        $v      = Get-ChillVersionAt $file $log $i
+        $h      = $log.Hashes[$i]
+        $commit = @{ Hash = $h; Date = (ConvertTo-ChillDate $log.Dates[$h]) }
+        if ($run -and $v -eq $run.Version) { $run.Original = $commit; $run.Commits.Add($commit); continue }
+        if ($v -eq $installed) { return $versions }
+        $run = $null
         if (-not $v -or -not $seen.Add($v)) { continue }
-        if ($v -eq $installed) { return $newer }
-        $newer = $v
+        $run = @{ Version = $v; Original = $commit; Newest = $commit; Commits = [System.Collections.Generic.List[hashtable]]::new() }
+        $run.Commits.Add($commit)
+        $versions.Add($run)
     }
+}
+
+# The manifest fields Scoop's schema has deciding what is downloaded, where it
+# goes, what it links or sets, and what runs. Description, notes, checkver,
+# autoupdate and the like change nothing that is installed.
+$script:ChillInstallFieldNames = @(
+    'url', 'hash', 'extract_dir', 'extract_to', 'innosetup', 'depends',
+    'bin', 'shortcuts', 'persist', 'psmodule', 'env_add_path', 'env_set',
+    'installer', 'uninstaller', 'pre_install', 'post_install', 'pre_uninstall', 'post_uninstall'
+)
+
+# What a manifest installs: each install field, top level and per architecture,
+# keyed by its path ('architecture.64bit.url') and rendered as JSON to compare.
+function Get-ChillInstallFields([object]$manifest) {
+    $fields = @{}
+    $scopes = @(@{ Prefix = ''; Value = $manifest })
+    if ($manifest.architecture) {
+        foreach ($arch in @($manifest.architecture.PSObject.Properties)) {
+            $scopes += @{ Prefix = "architecture.$($arch.Name)."; Value = $arch.Value }
+        }
+    }
+    foreach ($scope in $scopes) {
+        foreach ($name in $script:ChillInstallFieldNames) {
+            $value = $scope.Value.$name
+            if ($null -ne $value) { $fields["$($scope.Prefix)$name"] = ConvertTo-Json -InputObject $value -Compress -Depth 20 }
+        }
+    }
+    return $fields
+}
+
+# The first commit in $run, a version's run of commits, that changed what its
+# release installs, with Fields naming what changed; $null when every commit
+# kept it.
+function Find-ChillInstallRewrite([hashtable]$file, [hashtable]$run) {
+    if ($run.Commits.Count -lt 2) { return $null }
+    $installs = @{}
+    foreach ($commit in $run.Commits) {
+        $json = git -C $file.BucketRoot show "$($commit.Hash):$($file.RelPath)" 2>$null
+        $installs[$commit.Hash] = Get-ChillInstallFields ($json -join "`n" | ConvertFrom-Json)
+    }
+    $released = $installs[$run.Original.Hash]
+    # Commits are newest first, so walk them oldest first to find the first change.
+    for ($i = $run.Commits.Count - 2; $i -ge 0; $i--) {
+        $current = $installs[$run.Commits[$i].Hash]
+        $changed = @(@($released.Keys) + @($current.Keys) | Sort-Object -Unique | Where-Object { $released[$_] -cne $current[$_] })
+        if ($changed) { return @{ Hash = $run.Commits[$i].Hash; Date = $run.Commits[$i].Date; Fields = $changed } }
+    }
+    return $null
+}
+
+# How many versions in history are newer than $version, or $null when $version
+# is not in history at all. Distinct versions, counted from the newest run of
+# each, so a rewrite does not count twice.
+function Measure-ChillVersionsBehind([hashtable]$file, [string]$version) {
+    $log = Get-ChillLog $file
+    if (-not $log) { return $null }
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
+    for ($i = 0; ; $i++) {
+        Expand-ChillLog $log ($i + 1)
+        if ($i -ge $log.Hashes.Count) { return $null }
+        $v = Get-ChillVersionAt $file $log $i
+        if ($v -eq $version) { return $seen.Count }
+        if ($v) { $seen.Add($v) | Out-Null }
+    }
+}
+
+# The newest version past the age gate, judged by when chill first saw it;
+# failing that, the oldest, which is the next to pass it.
+function Select-ChillUpdateTarget([object[]]$versions, [datetime]$cutoff) {
+    $aged = @($versions | Where-Object { $_.Seen -and $_.Seen -lt $cutoff })
+    if ($aged) { return $aged[0] }
+    return $versions | Select-Object -Last 1
 }
 
 #endregion
@@ -282,6 +374,29 @@ function Get-ChillDirtyBucket([string[]]$named) {
             Bucket  = $bucket
             Root    = $root
             Changes = $changes
+        }
+    }
+}
+
+# Buckets a refresh begun at $since left behind. scoop's sync runs 'git pull'
+# and ignores its failure, so check each bucket that tracks a remote: the fetch
+# must have written FETCH_HEAD since then, and its result must be in HEAD. A
+# failed fetch still rewrites FETCH_HEAD, but leaves it empty.
+function Get-ChillUnsyncedBucket([datetime]$since) {
+    foreach ($bucket in Get-LocalBucket) {
+        $root = Find-BucketDirectory $bucket -Root
+        if (-not (Test-Path "$root\.git")) { continue }
+        $upstream = git -C $root rev-parse --verify -q '@{u}' 2>$null
+        if (-not $upstream) { continue }
+        $fetchHead = Get-Item (Join-Path $root (git -C $root rev-parse --git-path FETCH_HEAD)) -ErrorAction SilentlyContinue
+        $isFetched = $fetchHead -and $fetchHead.LastWriteTime -ge $since -and $fetchHead.Length -gt 0
+        git -C $root merge-base --is-ancestor $upstream HEAD 2>$null
+        $isMerged = $LASTEXITCODE -eq 0
+        if ($isFetched -and $isMerged) { continue }
+        [pscustomobject]@{
+            Bucket  = $bucket
+            Reason  = if (-not $isFetched) { 'could not fetch' } else { 'could not merge' }
+            IsDirty = [bool](git -C $root status --porcelain)
         }
     }
 }
@@ -336,57 +451,25 @@ function Get-ChillState([string]$name, [string]$dir) {
 
 function Set-ChillState([string]$name, [hashtable]$entry, [string]$dir) {
     New-Item $dir -ItemType Directory -Force | Out-Null
+    $seen = @{}
+    if ($entry['Seen'] -is [System.Collections.IDictionary]) {
+        foreach ($kv in $entry['Seen'].GetEnumerator()) { $seen[$kv.Key] = ConvertFrom-ChillDate $kv.Value }
+    }
     Write-ChillJson @{
-        Version       = $entry.Version
-        VersionHash   = $entry['VersionHash']
-        Repushed      = [bool]$entry['Repushed']
-        FirstSeen     = ConvertFrom-ChillDate $entry.FirstSeen
-        UpdatedAt     = ConvertFrom-ChillDate $entry.UpdatedAt
-        ScriptHeld    = $entry.ScriptHeld
-        Proxy         = [bool]$entry['Proxy']
-        PinnedVersion = $entry['PinnedVersion']
-        PinnedHash    = $entry['PinnedHash']
-        PinnedDate    = ConvertFrom-ChillDate $entry['PinnedDate']
+        ScriptHeld = [bool]$entry['ScriptHeld']
+        Proxy      = [bool]$entry['Proxy']
+        Seen       = $seen
     } (Join-Path $dir "$name.json")
 }
 
-# Read-modify-write of one state field, for the pin and proxy subcommands, which
+# Read-modify-write of one state field, for holds and the proxy subcommand, which
 # edit state for apps that may have no entry yet.
 function Update-ChillState([string]$name, [string]$dir, [hashtable]$fields) {
     $st = Get-ChillState $name $dir
-    if (-not $st) { $st = @{ Version = $null; VersionHash = $null; FirstSeen = $null; UpdatedAt = $null; ScriptHeld = $false } }
+    if (-not $st) { $st = @{ ScriptHeld = $false } }
     foreach ($kv in $fields.GetEnumerator()) { $st[$kv.Key] = $kv.Value }
     Set-ChillState $name $st $dir
     return $st
-}
-
-function Set-ChillPin([string]$name, [string]$version, [string]$dir) {
-    $file = Find-ChillManifest $name
-    if (-not $file) { Write-Warning "$($name): no bucket manifest found; cannot pin"; return }
-    $commit = Find-ChillVersionCommit $version $file
-    if (-not $commit) { Write-Warning "$($name): version $version not found in git history; pin not set"; return }
-    Update-ChillState $name $dir @{
-        PinnedVersion = $version
-        PinnedHash    = $commit.Hash
-        PinnedDate    = $commit.Date
-    } | Out-Null
-}
-
-function Clear-ChillPin([string]$name, [string]$dir) {
-    if (-not (Get-ChillState $name $dir)) { return }
-    Update-ChillState $name $dir @{ PinnedVersion = $null; PinnedHash = $null; PinnedDate = $null } | Out-Null
-}
-
-# Version to pin for a bare `chill pin <app>`: one step newer than what is
-# installed. Warns rather than returning silently, since the caller named an app.
-function Resolve-ChillNextPin([string]$name) {
-    $installed = Select-CurrentVersion -AppName $name
-    if (-not $installed) { Write-Warning "$($name): not installed, cannot pin to next version"; return $null }
-    $file = Find-ChillManifest $name
-    if (-not $file) { Write-Warning "$($name): no bucket manifest found"; return $null }
-    $next = Find-ChillNextVersion $file $installed
-    if (-not $next) { Write-Warning "$($name): already at the newest version in bucket history ($installed)" }
-    return $next
 }
 
 #endregion
@@ -407,87 +490,54 @@ function ConvertTo-ChillTargets([string[]]$arguments) {
     }
 }
 
-# Merge stored state with current bucket facts into a full entry.
-function Resolve-ChillEntry([string]$name, [string]$latest, [nullable[datetime]]$manifestDate, [hashtable]$file, [hashtable]$stored, [datetime]$now, [bool]$skipAutoPin = $false) {
-    if ($stored -and $stored.Version -eq $latest) {
-        $entry = @{
-            Version       = $stored.Version
-            VersionHash   = $stored['VersionHash']
-            Repushed      = [bool]$stored['Repushed']
-            FirstSeen     = ConvertTo-ChillDate $stored.FirstSeen
-            UpdatedAt     = ConvertTo-ChillDate $stored.UpdatedAt
-            ScriptHeld    = [bool]$stored['ScriptHeld']
-            Proxy         = [bool]$stored['Proxy']
-            PinnedVersion = $stored['PinnedVersion']
-            PinnedHash    = $stored['PinnedHash']
-            PinnedDate    = ConvertTo-ChillDate $stored['PinnedDate']
-        }
-        if ($manifestDate -and $entry.UpdatedAt -and $manifestDate -ne $entry.UpdatedAt) {
-            $entry.Repushed = $true
-        }
-        $entry.UpdatedAt = $manifestDate
-    } else {
-        $commit = Find-ChillVersionCommit $latest $file
-        $entry  = @{
-            Version       = $latest
-            VersionHash   = $commit.Hash
-            Repushed      = $false
-            FirstSeen     = if ($commit.Date) { $commit.Date } else { $now }
-            UpdatedAt     = $manifestDate
-            ScriptHeld    = if ($stored) { [bool]$stored['ScriptHeld'] } else { $false }
-            Proxy         = if ($stored) { [bool]$stored['Proxy'] } else { $false }
-            PinnedVersion = $null
-            PinnedHash    = $null
-            PinnedDate    = $null
-        }
-        if ($stored -and $stored['PinnedVersion']) {
-            $entry['PinnedVersion'] = $stored['PinnedVersion']
-            $entry['PinnedHash']    = $stored['PinnedHash']
-            $entry['PinnedDate']    = ConvertTo-ChillDate $stored['PinnedDate']
-        } elseif (!$skipAutoPin -and $stored -and $stored['ScriptHeld'] -and $stored['Version'] -and -not $stored['Repushed']) {
-            # Latest moved past a version we were holding: pin to that version so
-            # the upgrade path goes through it first.
-            $pinCommit = Find-ChillVersionCommit $stored['Version'] $file
-            $entry['PinnedVersion'] = $stored['Version']
-            $entry['PinnedHash']    = $pinCommit.Hash
-            $entry['PinnedDate']    = $pinCommit.Date
+# The stored state a decision reads, defaulted for an app that has none. Seen
+# maps each version to when chill first saw it; an unreadable date counts as
+# never seen, which only delays that version.
+function ConvertTo-ChillEntry([hashtable]$stored) {
+    if (-not $stored) { $stored = @{} }
+    $seen = @{}
+    if ($stored['Seen'] -is [System.Collections.IDictionary]) {
+        foreach ($kv in $stored['Seen'].GetEnumerator()) {
+            $date = ConvertTo-ChillDate $kv.Value
+            if ($date) { $seen[$kv.Key] = $date }
         }
     }
-    # History catches re-pushes predating state or observed by older releases.
-    if ($manifestDate -and -not $entry['Repushed']) {
-        # With VersionHash, FirstSeen is the introduction date; reuse it to avoid a history walk.
-        $introDate = $entry.FirstSeen
-        if (-not $entry['VersionHash'] -or -not $introDate) {
-            $intro = Find-ChillVersionCommit $latest $file
-            $introDate = $intro.Date
-            if ($intro.Hash -and $intro.Date) {
-                $entry.VersionHash = $intro.Hash
-                $entry.FirstSeen = $intro.Date
-            }
-        }
-        if ($introDate -and $manifestDate -ne $introDate) { $entry.Repushed = $true }
+    @{
+        ScriptHeld = [bool]$stored['ScriptHeld']
+        Proxy      = [bool]$stored['Proxy']
+        Seen       = $seen
     }
-    if (-not $entry.FirstSeen) { $entry.FirstSeen = $now }
-    return $entry
 }
 
-# A pin gates on the pinned version's date; everything else on latest's first-seen.
+# When chill first saw each of $versions: the recorded date, or $at for a
+# version it has not seen before. Never a git date, which a commit's author
+# sets and can backdate. Dates covers $versions alone, so a version no longer
+# in question drops out of state on the next write; Unrecorded lists the
+# versions $at was given to.
+function Get-ChillFirstSeen([hashtable]$recorded, [string[]]$versions, [datetime]$at) {
+    $dates      = @{}
+    $unrecorded = [System.Collections.Generic.List[string]]::new()
+    foreach ($version in $versions) {
+        if (-not $version -or $dates.ContainsKey($version)) { continue }
+        if ($recorded -and $recorded.ContainsKey($version)) {
+            $dates[$version] = $recorded[$version]
+        } else {
+            $dates[$version] = $at
+            $unrecorded.Add($version)
+        }
+    }
+    return @{ Dates = $dates; Unrecorded = @($unrecorded) }
+}
+
+# Gates on when chill first saw the update target.
 # $status is scoop's own app_status hashtable, whose .hold is a real boolean,
 # rather than the 'Held package' text scoop status joins into its Info column.
 function Get-ChillDecision([hashtable]$entry, [hashtable]$status, [datetime]$cutoff, [bool]$forced) {
     $manualHold = [bool]$status.hold -and -not $entry.ScriptHeld
-    $gate       = if ($entry['PinnedVersion']) { $entry['PinnedDate'] } else { $entry.FirstSeen }
-    if ($entry['PinnedVersion'] -and -not $gate) {
-        # The auto-pin path can store a pin whose version has aged out of the
-        # manifest history; a null date would otherwise hold forever, silently.
-        Write-Warning "$($status.name): pinned $($entry['PinnedVersion']) has no resolvable date; gating on first-seen"
-        $gate = $entry.FirstSeen
-    }
-    $repushed = $entry['Repushed'] -and (!$entry['PinnedVersion'] -or $entry['PinnedVersion'] -eq $entry.Version)
-    $ready = $forced -or (!$repushed -and $gate -and $gate -lt $cutoff)
+    $gate       = $entry['TargetDate']
+    $ready =$forced -or ($gate -and $gate -lt $cutoff)
 
-    $action = if ($repushed -and -not $forced) { 'Repushed' }
-              elseif ($manualHold -and -not $forced) { 'ManualHold' }
+    $action = if ($manualHold -and -not $forced) { 'ManualHold' }
               elseif ($ready)                    { if ($forced) { 'Forced' } else { 'Ready' } }
               else                               { 'Held' }
 
@@ -523,6 +573,12 @@ function Set-ChillHold([string]$name, [bool]$held) {
     return $true
 }
 
+# Set scoop's hold and record that this command owns it, or no longer does. The
+# record is written only once the hold has landed.
+function Set-ChillOwnedHold([string]$name, [bool]$held, [string]$dir) {
+    if (Set-ChillHold $name $held) { Update-ChillState $name $dir @{ ScriptHeld = $held } | Out-Null }
+}
+
 # Run $action with scoop routed through $url. scoop reads the proxy from a
 # process-global static that Invoke-Download and the aria2 option builder both
 # consult, so this needs no config file write: nothing can leak past the process,
@@ -556,27 +612,27 @@ function Invoke-ChillProxied([string]$url, [scriptblock]$action) {
     }
 }
 
-# Swap the bucket manifest to a pinned commit, update, then restore it. Refuses
-# when the manifest already differs from HEAD, so the restoring checkout cannot
-# discard a pre-existing local edit.
-function Invoke-ChillPinnedUpdate([string]$name, [string]$pinnedHash, [hashtable]$file, [hashtable]$options) {
+# Swap the bucket manifest to a historical commit, update, then restore it.
+# Refuses when the manifest already differs from HEAD, so the restoring checkout
+# cannot discard a pre-existing local edit.
+function Invoke-ChillHistoricalUpdate([string]$name, [string]$commitHash, [hashtable]$file, [hashtable]$options) {
     $dirty = git -C $file.BucketRoot status --porcelain -- $file.RelPath 2>$null
     if ($dirty) {
-        Write-Warning "$($name): bucket manifest $($file.RelPath) has uncommitted changes; skipping pinned update to avoid clobbering them"
+        Write-Warning "$($name): bucket manifest $($file.RelPath) has uncommitted changes; skipping historical update to avoid clobbering them"
         return $false
     }
-    $pinned = git -C $file.BucketRoot show "${pinnedHash}:$($file.RelPath)" 2>$null
-    if (-not $pinned) {
-        Write-Warning "$($name): could not retrieve manifest at $pinnedHash from git"
+    $historical = git -C $file.BucketRoot show "${commitHash}:$($file.RelPath)" 2>$null
+    if (-not $historical) {
+        Write-Warning "$($name): could not retrieve manifest at $commitHash from git"
         return $false
     }
     try {
-        $expected = ($pinned -join [Environment]::NewLine | ConvertFrom-Json).version
-        Write-ChillUtf8 ($pinned -join [Environment]::NewLine) $file.ManifestPath
+        $expected = ($historical -join [Environment]::NewLine | ConvertFrom-Json).version
+        Write-ChillUtf8 ($historical -join [Environment]::NewLine) $file.ManifestPath
         Invoke-ChillScoopUpdate $name $options
         # Scoop can return without updating (e.g. when the app is running).
         if ((Select-CurrentVersion -AppName $name) -ne $expected) {
-            Write-Warning "$($name): requested $expected was not installed; keeping any existing pin"
+            Write-Warning "$($name): requested $expected was not installed"
             return $false
         }
         return $true
@@ -590,34 +646,21 @@ function Invoke-ChillPinnedUpdate([string]$name, [string]$pinnedHash, [hashtable
 
 # scoop's update, in this process. $options carries the flags scoop's own
 # 'update' takes, so a caller can pass them through without a subprocess.
+# By name: scoop #6730 put $force third, and positional arguments then landed
+# one parameter late, -q forcing a reinstall and -k and -s going unread.
 function Invoke-ChillScoopUpdate([string]$name, [hashtable]$options) {
-    update $name $false $options.Quiet $options.Independent $options.Suggested $options.UseCache $options.CheckHash
+    update -app $name -global $false -quiet $options.Quiet -independent $options.Independent -suggested $options.Suggested -use_cache $options.UseCache -check_hash $options.CheckHash
 }
 
 # A forced app still needs unholding here; ready apps were unheld in the
 # decision pass.
-function Invoke-ChillAppUpdate([object]$result, [string]$dir, [hashtable]$options) {
+function Invoke-ChillAppUpdate([object]$result, [hashtable]$options) {
     if ($result.Action -eq 'Forced') { Set-ChillHold $result.Name $false | Out-Null }
-    if ($result.TargetVersion) {
-        Invoke-ChillPinnedUpdate $result.Name $result.TargetHash $result.TargetFile $options | Out-Null
+    if ($result.TargetHash) {
+        Invoke-ChillHistoricalUpdate $result.Name $result.TargetHash $result.TargetFile $options | Out-Null
         return
     }
-    if ($result.Pin -eq '') {
-        Invoke-ChillScoopUpdate $result.Name $options
-        return
-    }
-    $file = Find-ChillManifest $result.Name
-    $st   = Get-ChillState $result.Name $dir
-    $hash = if ($st) { $st['PinnedHash'] } else { $null }
-    if (-not $hash -and $file) { $hash = (Find-ChillVersionCommit $result.Pin $file).Hash }
-    # $st gates too: the success path below indexes it to clear the pin.
-    if (-not $st -or -not $hash -or -not $file) {
-        Write-Warning "$($result.Name): could not resolve pinned $($result.Pin) in git history, skipping"
-        return
-    }
-    if (Invoke-ChillPinnedUpdate $result.Name $hash $file $options) {
-        Clear-ChillPin $result.Name $dir
-    }
+    Invoke-ChillScoopUpdate $result.Name $options
 }
 
 #endregion
